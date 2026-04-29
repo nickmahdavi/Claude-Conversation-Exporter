@@ -8,7 +8,8 @@ const DEFAULT_MODEL_TIMELINE = [
   { date: new Date('2024-10-22'), model: 'claude-3-5-sonnet-20241022' }, // Starting October 22, 2024
   { date: new Date('2025-02-29'), model: 'claude-3-7-sonnet-20250219' }, // Starting February 29, 2025
   { date: new Date('2025-05-14'), model: 'claude-sonnet-4-20250514' }, // Starting May 14, 2025
-  { date: new Date('2025-09-29'), model: 'claude-sonnet-4-5-20250929' } // Starting September 29, 2025
+  { date: new Date('2025-09-29'), model: 'claude-sonnet-4-5-20250929' }, // Starting September 29, 2025
+  { date: new Date('2026-02-17'), model: 'claude-sonnet-4-6' } // Starting February 17, 2026
 ];
 
 // Infer model for conversations with null model based on date
@@ -105,17 +106,39 @@ function convertToMarkdown(data, includeMetadata) {
   if (includeMetadata) {
     markdown += `**Created:** ${new Date(data.created_at).toLocaleString()}\n`;
     markdown += `**Updated:** ${new Date(data.updated_at).toLocaleString()}\n`;
-    markdown += `**Model:** ${data.model}\n\n`;
-    markdown += '---\n\n';
+    markdown += `**Model:** ${data.model}\n`;
+    if (data.truncated !== undefined) {
+      markdown += `**Truncated:** ${data.truncated}\n`;
+    }
+    markdown += '\n---\n\n';
   }
-  
+
   // Get only the current branch messages
   const branchMessages = getCurrentBranch(data);
-  
+
   for (const message of branchMessages) {
     const sender = message.sender === 'human' ? '**You**' : '**Claude**';
     markdown += `${sender}:\n\n`;
-    
+
+    // Show attachments if metadata enabled
+    if (includeMetadata && message.attachments && message.attachments.length > 0) {
+      for (const attachment of message.attachments) {
+        markdown += `> **Attachment:** ${attachment.file_name || '(unnamed)'}`;
+        if (attachment.file_size) {
+          const sizeKB = (attachment.file_size / 1024).toFixed(1);
+          markdown += ` (${sizeKB} KB)`;
+        }
+        if (attachment.file_type) {
+          markdown += ` [${attachment.file_type}]`;
+        }
+        markdown += '\n';
+        if (attachment.extracted_content) {
+          markdown += `>\n> <details><summary>Extracted content</summary>\n>\n> \`\`\`\n> ${attachment.extracted_content.replace(/\n/g, '\n> ')}\n> \`\`\`\n>\n> </details>\n`;
+        }
+      }
+      markdown += '\n';
+    }
+
     if (message.content) {
       for (const content of message.content) {
         if (content.text) {
@@ -125,11 +148,11 @@ function convertToMarkdown(data, includeMetadata) {
     } else if (message.text) {
       markdown += `${message.text}\n\n`;
     }
-    
+
     if (includeMetadata && message.created_at) {
       markdown += `*${new Date(message.created_at).toLocaleString()}*\n\n`;
     }
-    
+
     markdown += '---\n\n';
   }
   
