@@ -34,14 +34,14 @@
     
     .controls {
       display: flex;
-      gap: 15px;
+      gap: 10px;
       align-items: center;
       flex-wrap: wrap;
     }
-    
+
     .search-box {
-      flex: 1;
-      min-width: 300px;
+      flex: 1 1 200px;
+      min-width: 180px;
       position: relative;
     }
     
@@ -95,6 +95,42 @@
       font-size: 14px;
       background: white;
       cursor: pointer;
+    }
+
+    .filter-group input[type="date"] {
+      padding: 7px 8px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      font-size: 13px;
+      background: white;
+      cursor: pointer;
+      color: #333;
+      width: 140px;
+    }
+
+    .filter-group input[type="date"].invalid {
+      border-color: #d32f2f;
+      box-shadow: 0 0 0 3px rgba(211, 47, 47, 0.12);
+    }
+
+    .filter-group input[type="date"]:focus {
+      outline: none;
+      border-color: #5436DA;
+      box-shadow: 0 0 0 3px rgba(84, 54, 218, 0.1);
+    }
+
+    .clear-dates-btn {
+      background: none;
+      border: none;
+      color: #999;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 4px 6px;
+      line-height: 1;
+    }
+
+    .clear-dates-btn:hover {
+      color: #d32f2f;
     }
     
     .stats {
@@ -393,7 +429,23 @@
           <option value="">All Models</option>
         </select>
       </div>
-      
+
+      <div class="filter-group">
+        <label>Created:</label>
+        <input type="date" id="dateFrom" title="Created on or after this date">
+        <span>–</span>
+        <input type="date" id="dateTo" title="Created on or before this date">
+        <button id="clearDates" class="clear-dates-btn" title="Clear created-date filter">✕</button>
+      </div>
+
+      <div class="filter-group">
+        <label>Edited:</label>
+        <input type="date" id="updatedFrom" title="Last edited on or after this date">
+        <span>–</span>
+        <input type="date" id="updatedTo" title="Last edited on or before this date">
+        <button id="clearUpdated" class="clear-dates-btn" title="Clear edited-date filter">✕</button>
+      </div>
+
       <div class="filter-group">
         <label>Sort by:</label>
         <select id="sortBy">
@@ -423,8 +475,12 @@
           <input type="checkbox" id="includeMetadata" checked>
           Metadata
         </label>
+        <label title="Concurrent requests per batch — for tuning export speed">
+          Batch:
+          <input type="number" id="batchSize" min="1" max="7000" value="25">
+        </label>
       </div>
-      
+
       <button class="export-all-btn" id="exportAllBtn" disabled>
         Export All
       </button>
@@ -459,11 +515,15 @@
       font-size: 13px;
       color: #555;
     }
-    .export-settings select {
+    .export-settings select,
+    .export-settings input[type="number"] {
       padding: 4px 8px;
       border: 1px solid #ccc;
       border-radius: 3px;
       font-size: 13px;
+    }
+    .export-settings input[type="number"] {
+      width: 64px;
     }
   </style>
   

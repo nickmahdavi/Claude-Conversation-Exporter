@@ -140,20 +140,89 @@ function getModelBadgeClass(model) {
   return '';
 }
 
+// Validate the two date ranges (start must be on or before end).
+// Marks offending inputs with an .invalid class, shows a toast once,
+// and returns which ranges are valid so the filter can ignore bad ones.
+let lastDateWarning = 0;
+function validateDateRanges() {
+  const ranges = [
+    { from: 'dateFrom', to: 'dateTo', label: 'Created' },
+    { from: 'updatedFrom', to: 'updatedTo', label: 'Edited' },
+  ];
+
+  const result = {};
+  ranges.forEach(({ from, to, label }) => {
+    const fromEl = document.getElementById(from);
+    const toEl = document.getElementById(to);
+    const isValid = !(fromEl.value && toEl.value && fromEl.value > toEl.value);
+
+    fromEl.classList.toggle('invalid', !isValid);
+    toEl.classList.toggle('invalid', !isValid);
+
+    if (!isValid && Date.now() - lastDateWarning > 1500) {
+      showToast(`${label} "from" date must be on or before the "to" date`, true);
+      lastDateWarning = Date.now();
+    }
+
+    // Key results by the range purpose: created / updated
+    result[label === 'Created' ? 'created' : 'updated'] = isValid;
+  });
+
+  return result;
+}
+
+// Keep the native date pickers in sync so invalid ranges are hard to pick:
+// the "to" picker can't go before "from", and vice versa.
+function syncDateConstraints() {
+  const pairs = [['dateFrom', 'dateTo'], ['updatedFrom', 'updatedTo']];
+  pairs.forEach(([from, to]) => {
+    const fromEl = document.getElementById(from);
+    const toEl = document.getElementById(to);
+    toEl.min = fromEl.value || '';
+    fromEl.max = toEl.value || '';
+  });
+}
+
 // Apply filters and sorting
 function applyFiltersAndSort() {
   const searchTerm = document.getElementById('searchInput').value.toLowerCase();
   const modelFilter = document.getElementById('modelFilter').value;
-  
+
+  // Validate date ranges first; invalid (start > end) ranges are ignored
+  // so the list never silently shows wrong/empty results.
+  const valid = validateDateRanges();
+
+  // Build date boundaries (local time) from the YYYY-MM-DD inputs.
+  // Start = 00:00:00 of the "from" day, end = 23:59:59.999 of the "to" day.
+  const toBounds = (fromId, toId, isValid) => {
+    if (!isValid) return { from: null, to: null };
+    const fromVal = document.getElementById(fromId).value;
+    const toVal = document.getElementById(toId).value;
+    return {
+      from: fromVal ? new Date(`${fromVal}T00:00:00`).getTime() : null,
+      to: toVal ? new Date(`${toVal}T23:59:59.999`).getTime() : null,
+    };
+  };
+
+  const created = toBounds('dateFrom', 'dateTo', valid.created);
+  const updated = toBounds('updatedFrom', 'updatedTo', valid.updated);
+
+  const inRange = (time, bounds) =>
+    (bounds.from === null || time >= bounds.from) &&
+    (bounds.to === null || time <= bounds.to);
+
   // Filter conversations
   filteredConversations = allConversations.filter(conv => {
-    const matchesSearch = !searchTerm || 
+    const matchesSearch = !searchTerm ||
       conv.name.toLowerCase().includes(searchTerm) ||
       (conv.summary && conv.summary.toLowerCase().includes(searchTerm));
-    
+
     const matchesModel = !modelFilter || conv.model === modelFilter;
-    
-    return matchesSearch && matchesModel;
+
+    const matchesCreated = inRange(new Date(conv.created_at).getTime(), created);
+    const matchesUpdated = inRange(new Date(conv.updated_at).getTime(), updated);
+
+    return matchesSearch && matchesModel && matchesCreated && matchesUpdated;
   });
   
   // Sort conversations
@@ -373,8 +442,20 @@ async function exportAllFiltered() {
     
     progressText.textContent = `Exporting ${total} conversations...`;
     
-    // Process conversations in batches to avoid overwhelming the API
-    const batchSize = 3; // Process 3 at a time
+    // Concurrency is user-configurable via the "Batch" field so it can be tuned
+    // and measured empirically. Note the browser caps real HTTP/2 concurrency
+    // (~100ish in-flight requests per host) regardless of this value, so very
+    // large batch sizes plateau rather than going faster. Failures are caught
+    // per-item and logged to export_summary.json. Defaults to 25 if invalid.
+    const rawBatch = parseInt(document.getElementById('batchSize').value, 10);
+    const batchSize = Number.isFinite(rawBatch) && rawBatch > 0
+      ? Math.min(rawBatch, 7000)
+      : 25;
+    const interBatchDelayMs = 150;
+
+    // Time just the fetch phase (excludes ZIP creation) so batch-size tuning
+    // measures the thing it actually affects.
+    const fetchStart = performance.now();
     for (let i = 0; i < total; i += batchSize) {
       if (cancelExport) break;
       
@@ -437,12 +518,14 @@ async function exportAllFiltered() {
       progressBar.style.width = `${progress}%`;
       progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
       
-      // Small delay between batches
+      // Small delay between batches (see batching rationale above)
       if (i + batchSize < total && !cancelExport) {
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, interBatchDelayMs));
       }
     }
-    
+
+    const fetchSeconds = Number(((performance.now() - fetchStart) / 1000).toFixed(1));
+
     if (cancelExport) {
       progressModal.style.display = 'none';
       showToast('Export cancelled', true);
@@ -457,7 +540,10 @@ async function exportAllFiltered() {
       failed_exports: failed,
       failed_conversations: failedConversations,
       format: format,
-      include_metadata: includeMetadata
+      include_metadata: includeMetadata,
+      batch_size: batchSize,
+      fetch_seconds: fetchSeconds,
+      throughput_per_sec: fetchSeconds > 0 ? Number((completed / fetchSeconds).toFixed(1)) : null
     };
     zip.file('export_summary.json', JSON.stringify(summary, null, 2));
     
@@ -488,9 +574,9 @@ async function exportAllFiltered() {
     progressModal.style.display = 'none';
     
     if (failed > 0) {
-      showToast(`Exported ${completed} of ${total} conversations (${failed} failed). Check export_summary.json in the ZIP for details.`);
+      showToast(`Exported ${completed} of ${total} (${failed} failed) — batch ${batchSize}, ${fetchSeconds}s fetch. See export_summary.json.`);
     } else {
-      showToast(`Successfully exported all ${completed} conversations!`);
+      showToast(`Exported all ${completed} conversations — batch ${batchSize}, ${fetchSeconds}s fetch.`);
     }
     
   } catch (error) {
@@ -547,6 +633,31 @@ function setupEventListeners() {
   
   // Model filter
   document.getElementById('modelFilter').addEventListener('change', applyFiltersAndSort);
+
+  // Date range filters (created + last edited)
+  const dateInputs = ['dateFrom', 'dateTo', 'updatedFrom', 'updatedTo'];
+  dateInputs.forEach(id => {
+    document.getElementById(id).addEventListener('change', () => {
+      syncDateConstraints();
+      applyFiltersAndSort();
+    });
+  });
+
+  // Clear created-date filter
+  document.getElementById('clearDates').addEventListener('click', () => {
+    document.getElementById('dateFrom').value = '';
+    document.getElementById('dateTo').value = '';
+    syncDateConstraints();
+    applyFiltersAndSort();
+  });
+
+  // Clear edited-date filter
+  document.getElementById('clearUpdated').addEventListener('click', () => {
+    document.getElementById('updatedFrom').value = '';
+    document.getElementById('updatedTo').value = '';
+    syncDateConstraints();
+    applyFiltersAndSort();
+  });
   
   // Sort dropdown
   document.getElementById('sortBy').addEventListener('change', (e) => {
