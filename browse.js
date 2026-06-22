@@ -4,6 +4,103 @@ let filteredConversations = [];
 let orgId = null;
 let currentSort = 'updated_desc';
 
+// Maps project uuid -> project name, populated from the /projects endpoint.
+let projectMap = {};
+// UUIDs of conversations currently open in tabs in THIS Chrome window.
+// Populated on demand via chrome.tabs.query (see refreshOpenTabs).
+let openTabUuids = new Set();
+// The exact phrase the user must type to confirm a delete, e.g. "DELETE 42".
+// Set per-open in openDeleteModal so it reflects the current count.
+let deleteConfirmPhrase = 'DELETE';
+
+// --- Conversation list caching (stale-while-revalidate) ---
+// Bump CACHE_VERSION whenever the cached object shape changes, to invalidate
+// stale caches from older builds.
+const CACHE_VERSION = 1;
+// How long a cache is considered "fresh": within this window we skip the
+// network entirely on open. Past it, we still render from cache instantly but
+// refresh in the background. Tune to taste.
+const STALE_AFTER_MS = 5 * 60 * 1000; // 5 minutes
+let lastCachedAt = null;        // ms timestamp the current data was fetched
+let currentSignature = null;    // cheap fingerprint to detect "nothing changed"
+
+function cacheKey() {
+  return `convCache:${orgId}`;
+}
+
+// Cheap fingerprint of a conversation list: count + newest updated_at.
+// ISO timestamps sort lexicographically, so string max is fine.
+function signatureOf(list) {
+  let max = '';
+  for (const c of list) {
+    if (c.updated_at && c.updated_at > max) max = c.updated_at;
+  }
+  return `${list.length}:${max}`;
+}
+
+// Human-friendly relative time, e.g. "just now", "3m ago", "2h ago".
+function relativeTime(ts) {
+  const secs = Math.round((Date.now() - ts) / 1000);
+  if (secs < 45) return 'just now';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
+
+// Update the little "· updated 3m ago" / "· refreshing…" hint in the stats bar.
+function updateCacheStatus(state) {
+  const el = document.getElementById('cacheAge');
+  if (!el) return;
+  if (state === 'refreshing') {
+    el.textContent = ' · refreshing…';
+  } else if (lastCachedAt) {
+    el.textContent = ` · updated ${relativeTime(lastCachedAt)}`;
+  } else {
+    el.textContent = '';
+  }
+}
+
+// Read cached conversations for this org and render immediately.
+// Returns true if a usable cache was found and rendered.
+function loadFromCache() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([cacheKey()], (res) => {
+      const cached = res[cacheKey()];
+      if (!cached || cached.v !== CACHE_VERSION || !Array.isArray(cached.conversations)) {
+        resolve(false);
+        return;
+      }
+      projectMap = cached.projectMap || {};
+      allConversations = cached.conversations;
+      lastCachedAt = cached.cachedAt || null;
+      currentSignature = signatureOf(allConversations);
+      rebuildFilters();
+      applyFiltersAndSort();
+      updateCacheStatus();
+      resolve(true);
+    });
+  });
+}
+
+// Persist the current resolved conversations + project map for this org.
+function saveToCache() {
+  lastCachedAt = Date.now();
+  const payload = {
+    v: CACHE_VERSION,
+    cachedAt: lastCachedAt,
+    projectMap,
+    conversations: allConversations,
+  };
+  chrome.storage.local.set({ [cacheKey()]: payload }, () => {
+    if (chrome.runtime.lastError) {
+      console.warn('Failed to write conversation cache:', chrome.runtime.lastError);
+    }
+  });
+}
+
 // Model name mappings
 const MODEL_DISPLAY_NAMES = {
   'claude-3-sonnet-20240229': 'Claude 3 Sonnet',
@@ -38,8 +135,18 @@ const DEFAULT_MODEL_TIMELINE = [
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', async () => {
   await loadOrgId();
-  await loadConversations();
   setupEventListeners();
+  await refreshOpenTabs();
+  if (!orgId) return;
+
+  // Stale-while-revalidate: render instantly from cache, then refresh only if stale.
+  const hadCache = await loadFromCache();
+  if (hadCache) {
+    const age = lastCachedAt ? Date.now() - lastCachedAt : Infinity;
+    if (age > STALE_AFTER_MS) revalidate(false); // background refresh, no await
+  } else {
+    await revalidate(true); // first-ever load: blocking, shows the spinner
+  }
 });
 
 // Infer model for conversations with null model based on date
@@ -76,60 +183,182 @@ async function loadOrgId() {
   });
 }
 
-// Load all conversations
-async function loadConversations() {
+// Load the org's projects so we can show/filter by project name.
+// Non-fatal: if it fails we just won't have project names.
+async function loadProjects() {
   if (!orgId) return;
-  
+
   try {
-    const response = await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations`, {
+    const response = await fetch(`https://claude.ai/api/organizations/${orgId}/projects`, {
       credentials: 'include',
-      headers: {
-        'Accept': 'application/json',
-      }
+      headers: { 'Accept': 'application/json' }
     });
-    
+
     if (!response.ok) {
-      throw new Error(`Failed to load conversations: ${response.status}`);
+      throw new Error(`HTTP ${response.status}`);
     }
-    
-    allConversations = await response.json();
-    console.log(`Loaded ${allConversations.length} conversations`);
-    
-    // Infer models for conversations with null model
-    allConversations = allConversations.map(conv => ({
+
+    const projects = await response.json();
+    projectMap = {};
+    projects.forEach(p => {
+      if (p && p.uuid) projectMap[p.uuid] = p.name || '(untitled project)';
+    });
+    console.log(`Loaded ${Object.keys(projectMap).length} projects`);
+  } catch (error) {
+    console.warn('Could not load projects (project names/filter may be unavailable):', error);
+  }
+}
+
+// Read a conversation's project UUID defensively — the list payload may expose
+// it as project_uuid or as a nested project object depending on API version.
+function getProjectUuid(conv) {
+  return conv.project_uuid || (conv.project && conv.project.uuid) || null;
+}
+
+// Re-scan tabs in the CURRENT Chrome window and collect the conversation UUIDs
+// of any open claude.ai/chat/<uuid> pages. Used by the "open in this window" filter.
+async function refreshOpenTabs() {
+  openTabUuids = new Set();
+  if (!chrome.tabs || !chrome.tabs.query) return;
+
+  try {
+    const tabs = await chrome.tabs.query({ currentWindow: true });
+    tabs.forEach(tab => {
+      if (!tab.url) return;
+      const match = tab.url.match(/claude\.ai\/chat\/([a-f0-9-]+)/i);
+      if (match) openTabUuids.add(match[1]);
+    });
+    console.log(`Found ${openTabUuids.size} open chat tab(s) in this window`);
+  } catch (error) {
+    console.warn('Could not read open tabs:', error);
+  }
+}
+
+// Populate the project filter dropdown from projects that actually appear
+// on at least one conversation (keeps the list tidy).
+function populateProjectFilter() {
+  const select = document.getElementById('projectFilter');
+  const usedProjectUuids = new Set(
+    allConversations.map(getProjectUuid).filter(Boolean)
+  );
+
+  // Preserve the current selection across re-population if still valid.
+  const previous = select.value;
+
+  const entries = [...usedProjectUuids]
+    .map(uuid => ({ uuid, name: projectMap[uuid] || '(unknown project)' }))
+    .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+
+  select.innerHTML =
+    '<option value="">All Projects</option>' +
+    '<option value="__none__">No project</option>' +
+    '<option value="__any__">Any project</option>' +
+    entries.map(e => `<option value="${e.uuid}">${e.name}</option>`).join('');
+
+  // Restore previous selection if the option still exists.
+  if ([...select.options].some(o => o.value === previous)) {
+    select.value = previous;
+  }
+}
+
+// Fetch the raw conversation list from the API (throws on failure).
+async function fetchConversationList() {
+  const response = await fetch(`https://claude.ai/api/organizations/${orgId}/chat_conversations`, {
+    credentials: 'include',
+    headers: { 'Accept': 'application/json' }
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to load conversations: ${response.status}`);
+  }
+  return response.json();
+}
+
+// Resolve raw list items into the shape the UI uses: infer model, attach project.
+function resolveConversations(raw) {
+  return raw.map(conv => {
+    const projectUuid = getProjectUuid(conv);
+    return {
       ...conv,
-      model: inferModel(conv)
-    }));
-    
-    // Extract unique models for filter
-    const models = [...new Set(allConversations.map(c => c.model))].filter(m => m).sort();
-    populateModelFilter(models);
-    
-    // Apply initial sort and display
-    applyFiltersAndSort();
-    
+      model: inferModel(conv),
+      projectUuid,
+      projectName: projectUuid ? (projectMap[projectUuid] || '(unknown project)') : null
+    };
+  });
+}
+
+// Rebuild the model + project filter dropdowns from current data.
+function rebuildFilters() {
+  const models = [...new Set(allConversations.map(c => c.model))].filter(m => m).sort();
+  populateModelFilter(models);
+  populateProjectFilter();
+}
+
+// Fetch fresh projects + conversations, update state/cache, and re-render if changed.
+// isInitial=true means there was no cache to show first, so we always render and
+// surface errors loudly; otherwise this is a quiet background refresh.
+async function revalidate(isInitial = false) {
+  if (!orgId) return;
+  try {
+    if (!isInitial) updateCacheStatus('refreshing');
+    await loadProjects();
+    const raw = await fetchConversationList();
+    const resolved = resolveConversations(raw);
+    const sig = signatureOf(resolved);
+
+    // Only touch the DOM when something actually changed — avoids flicker/scroll
+    // jumps on the common "nothing new" background refresh.
+    if (isInitial || sig !== currentSignature) {
+      allConversations = resolved;
+      currentSignature = sig;
+      rebuildFilters();
+      applyFiltersAndSort();
+    }
+    saveToCache();
+    updateCacheStatus();
+    console.log(`Revalidated: ${resolved.length} conversations`);
   } catch (error) {
     console.error('Error loading conversations:', error);
-    showError(`Failed to load conversations: ${error.message}`);
+    if (isInitial) {
+      showError(`Failed to load conversations: ${error.message}`);
+    } else {
+      showToast(`Refresh failed: ${error.message}`, true);
+      updateCacheStatus();
+    }
   }
 }
 
 // Populate model filter dropdown
 function populateModelFilter(models) {
   const modelFilter = document.getElementById('modelFilter');
+  const previous = modelFilter.value;
   modelFilter.innerHTML = '<option value="">All Models</option>';
-  
+
   models.forEach(model => {
     const option = document.createElement('option');
     option.value = model;
     option.textContent = formatModelName(model);
     modelFilter.appendChild(option);
   });
+
+  // Preserve the user's selection across re-population (background refreshes).
+  if ([...modelFilter.options].some(o => o.value === previous)) {
+    modelFilter.value = previous;
+  }
 }
 
 // Format model name for display
 function formatModelName(model) {
   return MODEL_DISPLAY_NAMES[model] || model;
+}
+
+// Minimal HTML escaping for values interpolated into table markup.
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Get model badge class
@@ -187,6 +416,8 @@ function syncDateConstraints() {
 function applyFiltersAndSort() {
   const searchTerm = document.getElementById('searchInput').value.toLowerCase();
   const modelFilter = document.getElementById('modelFilter').value;
+  const projectFilter = document.getElementById('projectFilter').value;
+  const openTabsOnly = document.getElementById('openTabsOnly').checked;
 
   // Validate date ranges first; invalid (start > end) ranges are ignored
   // so the list never silently shows wrong/empty results.
@@ -219,10 +450,25 @@ function applyFiltersAndSort() {
 
     const matchesModel = !modelFilter || conv.model === modelFilter;
 
+    // Project filter: "" = all, __none__ = no project, __any__ = has a project,
+    // otherwise match a specific project UUID.
+    let matchesProject = true;
+    if (projectFilter === '__none__') {
+      matchesProject = !conv.projectUuid;
+    } else if (projectFilter === '__any__') {
+      matchesProject = !!conv.projectUuid;
+    } else if (projectFilter) {
+      matchesProject = conv.projectUuid === projectFilter;
+    }
+
+    // Only chats open in a tab in this window (snapshot from refreshOpenTabs).
+    const matchesOpenTab = !openTabsOnly || openTabUuids.has(conv.uuid);
+
     const matchesCreated = inRange(new Date(conv.created_at).getTime(), created);
     const matchesUpdated = inRange(new Date(conv.updated_at).getTime(), updated);
 
-    return matchesSearch && matchesModel && matchesCreated && matchesUpdated;
+    return matchesSearch && matchesModel && matchesProject &&
+           matchesOpenTab && matchesCreated && matchesUpdated;
   });
   
   // Sort conversations
@@ -271,6 +517,8 @@ function displayConversations() {
   
   if (filteredConversations.length === 0) {
     tableContent.innerHTML = '<div class="no-results">No conversations found</div>';
+    document.getElementById('exportAllBtn').disabled = true;
+    document.getElementById('deleteAllBtn').disabled = true;
     return;
   }
   
@@ -282,6 +530,7 @@ function displayConversations() {
           <th class="sortable" data-sort="updated">Last Updated</th>
           <th class="sortable" data-sort="created">Created</th>
           <th>Model</th>
+          <th>Project</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -308,6 +557,11 @@ function displayConversations() {
           <span class="model-badge ${modelBadgeClass}">
             ${formatModelName(conv.model)}
           </span>
+        </td>
+        <td>
+          ${conv.projectName
+            ? `<span class="project-badge" title="${escapeHtml(conv.projectName)}">${escapeHtml(conv.projectName)}</span>`
+            : `<span class="project-badge none">—</span>`}
         </td>
         <td>
           <div class="actions">
@@ -345,14 +599,16 @@ function displayConversations() {
     });
   });
   
-  // Enable export all button
+  // Enable bulk-action buttons now that there are results
   document.getElementById('exportAllBtn').disabled = false;
+  document.getElementById('deleteAllBtn').disabled = false;
 }
 
 // Update statistics
 function updateStats() {
-  const stats = document.getElementById('stats');
+  const stats = document.getElementById('statsCount');
   stats.textContent = `Showing ${filteredConversations.length} of ${allConversations.length} conversations`;
+  updateCacheStatus();
 }
 
 // Export single conversation
@@ -589,6 +845,135 @@ async function exportAllFiltered() {
   }
 }
 
+// Open the type-to-confirm modal for deleting the currently filtered conversations.
+function openDeleteModal() {
+  const total = filteredConversations.length;
+  if (total === 0) return;
+
+  const modal = document.getElementById('deleteModal');
+  const warning = document.getElementById('deleteWarning');
+  const sample = document.getElementById('deleteSample');
+  const input = document.getElementById('deleteConfirmInput');
+  const confirmBtn = document.getElementById('deleteConfirm');
+
+  warning.innerHTML =
+    `You are about to permanently delete <strong>${total}</strong> ` +
+    `conversation${total === 1 ? '' : 's'} (everything currently shown by your filters).`;
+
+  // Show up to 8 names so the user can sanity-check the selection.
+  const names = filteredConversations.slice(0, 8).map(c => `• ${escapeHtml(c.name || '(untitled)')}`);
+  if (total > 8) names.push(`…and ${total - 8} more`);
+  sample.innerHTML = names.join('<br>');
+
+  // Require typing "DELETE <count>" — count makes accidental confirmation harder.
+  deleteConfirmPhrase = `DELETE ${total}`;
+  document.getElementById('deletePhrase').textContent = deleteConfirmPhrase;
+  input.placeholder = deleteConfirmPhrase;
+
+  input.value = '';
+  confirmBtn.disabled = true;
+  modal.style.display = 'block';
+  input.focus();
+}
+
+function closeDeleteModal() {
+  document.getElementById('deleteModal').style.display = 'none';
+}
+
+// Delete the filtered conversations via the API, with batched concurrency and
+// a progress bar (reuses the export progress modal). Irreversible.
+async function performDelete() {
+  closeDeleteModal();
+
+  const targets = [...filteredConversations];
+  const total = targets.length;
+
+  const progressModal = document.getElementById('progressModal');
+  const progressTitle = document.getElementById('progressTitle');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const progressStats = document.getElementById('progressStats');
+
+  progressTitle.textContent = 'Deleting Conversations';
+  progressText.textContent = `Deleting ${total} conversations...`;
+  progressBar.style.width = '0%';
+  progressStats.textContent = '';
+  progressModal.style.display = 'block';
+
+  let cancelDelete = false;
+  const cancelButton = document.getElementById('cancelExport');
+  cancelButton.onclick = () => {
+    cancelDelete = true;
+    progressText.textContent = 'Cancelling...';
+  };
+
+  let deleted = 0;
+  let failed = 0;
+  const failedNames = [];
+  const deletedUuids = new Set();
+
+  // Reuse the user's configured batch size for delete concurrency.
+  const rawBatch = parseInt(document.getElementById('batchSize').value, 10);
+  const batchSize = Number.isFinite(rawBatch) && rawBatch > 0 ? Math.min(rawBatch, 7000) : 25;
+
+  try {
+    for (let i = 0; i < total; i += batchSize) {
+      if (cancelDelete) break;
+
+      const batch = targets.slice(i, Math.min(i + batchSize, total));
+      await Promise.all(batch.map(async (conv) => {
+        try {
+          const response = await fetch(
+            `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}`,
+            { method: 'DELETE', credentials: 'include', headers: { 'Accept': 'application/json' } }
+          );
+          // Treat 404 as already-gone (success) rather than an error.
+          if (!response.ok && response.status !== 404) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          deleted++;
+          deletedUuids.add(conv.uuid);
+        } catch (error) {
+          console.error(`Failed to delete ${conv.name}:`, error);
+          failed++;
+          failedNames.push(conv.name);
+        }
+      }));
+
+      const progress = Math.round((deleted + failed) / total * 100);
+      progressBar.style.width = `${progress}%`;
+      progressStats.textContent = `${deleted} deleted, ${failed} failed out of ${total}`;
+
+      if (i + batchSize < total && !cancelDelete) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+    }
+
+    // Drop deleted conversations from local state and refresh the view.
+    allConversations = allConversations.filter(c => !deletedUuids.has(c.uuid));
+    populateProjectFilter();
+    applyFiltersAndSort();
+
+    progressModal.style.display = 'none';
+
+    if (failed > 0) {
+      showToast(`Deleted ${deleted} of ${total} (${failed} failed). See console for details.`, true);
+    } else if (cancelDelete) {
+      showToast(`Cancelled — deleted ${deleted} of ${total} before stopping.`, true);
+    } else {
+      showToast(`Deleted ${deleted} conversation${deleted === 1 ? '' : 's'}.`);
+    }
+  } catch (error) {
+    console.error('Delete error:', error);
+    progressModal.style.display = 'none';
+    showToast(`Delete failed: ${error.message}`, true);
+  } finally {
+    // Restore the progress modal title for future exports.
+    progressTitle.textContent = 'Exporting Conversations';
+    cancelButton.onclick = null;
+  }
+}
+
 // Conversion functions are now imported from utils.js
 // Functions available: getCurrentBranch, convertToMarkdown, convertToText, downloadFile
 
@@ -634,6 +1019,30 @@ function setupEventListeners() {
   // Model filter
   document.getElementById('modelFilter').addEventListener('change', applyFiltersAndSort);
 
+  // Project filter
+  document.getElementById('projectFilter').addEventListener('change', applyFiltersAndSort);
+
+  // "Open in this window" filter — re-scan tabs when toggled on so it's fresh.
+  document.getElementById('openTabsOnly').addEventListener('change', async (e) => {
+    if (e.target.checked) await refreshOpenTabs();
+    applyFiltersAndSort();
+  });
+
+  // Manual re-scan of open tabs
+  document.getElementById('refreshOpenTabs').addEventListener('click', async () => {
+    await refreshOpenTabs();
+    showToast(`Found ${openTabUuids.size} open chat tab(s) in this window`);
+    applyFiltersAndSort();
+  });
+
+  // Delete filtered conversations (type-to-confirm)
+  document.getElementById('deleteAllBtn').addEventListener('click', openDeleteModal);
+  document.getElementById('deleteCancel').addEventListener('click', closeDeleteModal);
+  document.getElementById('deleteConfirm').addEventListener('click', performDelete);
+  document.getElementById('deleteConfirmInput').addEventListener('input', (e) => {
+    document.getElementById('deleteConfirm').disabled = e.target.value.trim() !== deleteConfirmPhrase;
+  });
+
   // Date range filters (created + last edited)
   const dateInputs = ['dateFrom', 'dateTo', 'updatedFrom', 'updatedTo'];
   dateInputs.forEach(id => {
@@ -667,4 +1076,10 @@ function setupEventListeners() {
   
   // Export all button
   document.getElementById('exportAllBtn').addEventListener('click', exportAllFiltered);
+
+  // Manual refresh of the conversation list (force revalidate)
+  document.getElementById('refreshBtn').addEventListener('click', () => revalidate(false));
+
+  // Keep the "updated Xm ago" label from going stale while the page sits open.
+  setInterval(() => updateCacheStatus(), 60 * 1000);
 }

@@ -5,7 +5,9 @@
     "description": "Export your Claude.ai conversations with full message history",
       "permissions": [
     "activeTab",
+    "tabs",
     "storage",
+    "unlimitedStorage",
     "scripting"
   ],
     "host_permissions": [

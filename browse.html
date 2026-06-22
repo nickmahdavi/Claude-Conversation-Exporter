@@ -157,7 +157,30 @@
       background: #ccc;
       cursor: not-allowed;
     }
-    
+
+    .delete-all-btn {
+      padding: 10px 20px;
+      background: white;
+      color: #d32f2f;
+      border: 1px solid #d32f2f;
+      border-radius: 5px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .delete-all-btn:hover {
+      background: #d32f2f;
+      color: white;
+    }
+
+    .delete-all-btn:disabled {
+      background: #f5f5f5;
+      color: #bbb;
+      border-color: #ddd;
+      cursor: not-allowed;
+    }
+
     .container {
       max-width: 1400px;
       margin: 20px auto;
@@ -282,7 +305,28 @@
       background: #f3e5f5;
       color: #7b1fa2;
     }
-    
+
+    .project-badge {
+      display: inline-block;
+      max-width: 200px;
+      padding: 3px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+      background: #eef0fb;
+      color: #5436DA;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      vertical-align: bottom;
+    }
+
+    .project-badge.none {
+      background: transparent;
+      color: #bbb;
+      font-weight: 400;
+    }
+
     .actions {
       display: flex;
       gap: 8px;
@@ -431,6 +475,23 @@
       </div>
 
       <div class="filter-group">
+        <label>Project:</label>
+        <select id="projectFilter" title="Filter by project">
+          <option value="">All Projects</option>
+          <option value="__none__">No project</option>
+          <option value="__any__">Any project</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label title="Only show chats currently open in tabs in this Chrome window">
+          <input type="checkbox" id="openTabsOnly">
+          Open in this window
+        </label>
+        <button id="refreshOpenTabs" class="clear-dates-btn" title="Re-scan open tabs in this window">⟳</button>
+      </div>
+
+      <div class="filter-group">
         <label>Created:</label>
         <input type="date" id="dateFrom" title="Created on or after this date">
         <span>–</span>
@@ -459,7 +520,8 @@
       </div>
       
       <div class="stats" id="stats">
-        Loading...
+        <span id="statsCount">Loading...</span><span id="cacheAge"></span>
+        <button id="refreshBtn" class="clear-dates-btn" title="Refresh the conversation list from Claude now">↻</button>
       </div>
       
       <div class="export-settings">
@@ -483,6 +545,10 @@
 
       <button class="export-all-btn" id="exportAllBtn" disabled>
         Export All
+      </button>
+
+      <button class="delete-all-btn" id="deleteAllBtn" disabled title="Permanently delete all conversations currently shown">
+        Delete Filtered
       </button>
     </div>
   </div>
@@ -525,6 +591,10 @@
     .export-settings input[type="number"] {
       width: 64px;
     }
+    #deleteConfirm:disabled {
+      background: #e7a9a9;
+      cursor: not-allowed;
+    }
   </style>
   
   <div class="toast" id="toast"></div>
@@ -532,7 +602,7 @@
   <!-- Progress modal for bulk export -->
   <div id="progressModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 3000;">
     <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 8px; min-width: 400px;">
-      <h3 style="margin-top: 0;">Exporting Conversations</h3>
+      <h3 style="margin-top: 0;" id="progressTitle">Exporting Conversations</h3>
       <div style="margin: 20px 0;">
         <div id="progressText">Preparing export...</div>
         <div style="background: #e0e0e0; height: 20px; border-radius: 10px; margin-top: 10px; overflow: hidden;">
@@ -544,6 +614,24 @@
     </div>
   </div>
   
+  <!-- Delete confirmation modal -->
+  <div id="deleteModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 3000;">
+    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border-radius: 8px; min-width: 440px; max-width: 90vw;">
+      <h3 style="margin-top: 0; color: #d32f2f;">Delete conversations</h3>
+      <p style="margin: 12px 0; font-size: 14px;" id="deleteWarning"></p>
+      <div id="deleteSample" style="background: #faf7f7; border: 1px solid #f0dada; border-radius: 5px; padding: 10px; font-size: 13px; color: #555; margin-bottom: 16px;"></div>
+      <p style="font-size: 13px; color: #666; margin-bottom: 8px;">
+        This <strong>cannot be undone</strong>. Type <code id="deletePhrase" style="background:#f0f0f0;padding:1px 5px;border-radius:3px;">DELETE</code> to confirm:
+      </p>
+      <input type="text" id="deleteConfirmInput" placeholder="DELETE" autocomplete="off"
+        style="width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; margin-bottom: 16px;">
+      <div style="display: flex; gap: 10px; justify-content: flex-end;">
+        <button id="deleteCancel" style="padding: 8px 16px; background: #e0e0e0; color: #333; border: none; border-radius: 4px; cursor: pointer;">Cancel</button>
+        <button id="deleteConfirm" disabled style="padding: 8px 16px; background: #d32f2f; color: white; border: none; border-radius: 4px; cursor: pointer;">Delete</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Include JSZip locally -->
   <script src="jszip.min.js"></script>
   <script src="utils.js"></script>
