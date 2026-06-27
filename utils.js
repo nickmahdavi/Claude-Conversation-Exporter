@@ -1,5 +1,35 @@
 // Shared utility functions for Claude Exporter
 
+// Default model timeline for null models.
+// Each entry represents when that model became the default.
+const DEFAULT_MODEL_TIMELINE = [
+  { date: new Date('2024-01-01'), model: 'claude-3-sonnet-20240229' }, // Before June 20, 2024
+  { date: new Date('2024-06-20'), model: 'claude-3-5-sonnet-20240620' }, // Starting June 20, 2024
+  { date: new Date('2024-10-22'), model: 'claude-3-5-sonnet-20241022' }, // Starting October 22, 2024
+  { date: new Date('2025-02-24'), model: 'claude-3-7-sonnet-20250219' }, // Starting February 24, 2025
+  { date: new Date('2025-05-22'), model: 'claude-sonnet-4-20250514' }, // Starting May 22, 2025
+  { date: new Date('2025-09-29'), model: 'claude-sonnet-4-5-20250929' }, // Starting September 29, 2025
+  { date: new Date('2026-02-17'), model: 'claude-sonnet-4-6' } // Starting February 17, 2026
+];
+
+// Infer model for conversations with null model based on creation date.
+function inferModel(conversation) {
+  if (conversation.model) {
+    return conversation.model;
+  }
+
+  const conversationDate = new Date(conversation.created_at);
+
+  // Walk backwards to find the default model active at creation time.
+  for (let i = DEFAULT_MODEL_TIMELINE.length - 1; i >= 0; i--) {
+    if (conversationDate >= DEFAULT_MODEL_TIMELINE[i].date) {
+      return DEFAULT_MODEL_TIMELINE[i].model;
+    }
+  }
+
+  return DEFAULT_MODEL_TIMELINE[0].model;
+}
+
 // Helper function to reconstruct the current branch from the message tree
 function getCurrentBranch(data) {
   if (!data.chat_messages || !data.current_leaf_message_uuid) {

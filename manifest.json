@@ -39,7 +39,7 @@
   "options_page": "options.html",
   "web_accessible_resources": [
     {
-      "resources": ["browse.html"],
+      "resources": ["browse.html", "view.html"],
       "matches": ["<all_urls>"]
     }
   ]

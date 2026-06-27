@@ -340,6 +340,11 @@
       cursor: pointer;
       transition: all 0.2s;
       font-weight: 500;
+      /* Works for both <button> and <a> rendered as buttons */
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
     }
     
     .btn-export {
@@ -355,9 +360,18 @@
       background: #e0e0e0;
       color: #333;
     }
-    
+
     .btn-view:hover {
       background: #d0d0d0;
+    }
+
+    .btn-text {
+      background: #eef0fb;
+      color: #5436DA;
+    }
+
+    .btn-text:hover {
+      background: #e0e3f7;
     }
     
     .btn-small:disabled {

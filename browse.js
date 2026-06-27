@@ -120,17 +120,7 @@ const MODEL_DISPLAY_NAMES = {
   'claude-opus-4-6': 'Claude Opus 4.6'
 };
 
-// Default model timeline for null models
-// Each entry represents when that model became the default
-const DEFAULT_MODEL_TIMELINE = [
-  { date: new Date('2024-01-01'), model: 'claude-3-sonnet-20240229' }, // Before June 20, 2024
-  { date: new Date('2024-06-20'), model: 'claude-3-5-sonnet-20240620' }, // Starting June 20, 2024
-  { date: new Date('2024-10-22'), model: 'claude-3-5-sonnet-20241022' }, // Starting October 22, 2024
-  { date: new Date('2025-02-24'), model: 'claude-3-7-sonnet-20250219' }, // Starting February 24, 2025
-  { date: new Date('2025-05-22'), model: 'claude-sonnet-4-20250514' }, // Starting May 22, 2025
-  { date: new Date('2025-09-29'), model: 'claude-sonnet-4-5-20250929' }, // Starting September 29, 2025
-  { date: new Date('2026-02-17'), model: 'claude-sonnet-4-6' } // Starting February 17, 2026
-];
+// inferModel() + DEFAULT_MODEL_TIMELINE now live in utils.js (shared with view.js).
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', async () => {
@@ -148,27 +138,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     await revalidate(true); // first-ever load: blocking, shows the spinner
   }
 });
-
-// Infer model for conversations with null model based on date
-function inferModel(conversation) {
-  if (conversation.model) {
-    return conversation.model;
-  }
-  
-  // Use created_at date to determine which default model was active
-  const conversationDate = new Date(conversation.created_at);
-  
-  // Find the appropriate model based on the conversation date
-  // Start from the end and work backwards to find the right period
-  for (let i = DEFAULT_MODEL_TIMELINE.length - 1; i >= 0; i--) {
-    if (conversationDate >= DEFAULT_MODEL_TIMELINE[i].date) {
-      return DEFAULT_MODEL_TIMELINE[i].model;
-    }
-  }
-  
-  // If date is before all known dates, use the first model
-  return DEFAULT_MODEL_TIMELINE[0].model;
-}
 
 // Load organization ID from storage
 async function loadOrgId() {
@@ -221,16 +190,42 @@ async function refreshOpenTabs() {
   openTabUuids = new Set();
   if (!chrome.tabs || !chrome.tabs.query) return;
 
+  // Pull a uuid out of either a live chat URL or our viewer URL; null otherwise.
+  const uuidFromUrl = (url) => {
+    if (!url) return null;
+    const chat = url.match(/claude\.ai\/chat\/([0-9a-f-]{8,})/i);
+    if (chat) return chat[1];
+    if (url.includes('view.html')) {
+      try { return new URL(url).searchParams.get('id'); } catch (_) { return null; }
+    }
+    return null;
+  };
+
   try {
     const tabs = await chrome.tabs.query({ currentWindow: true });
+    let hidden = 0;
     tabs.forEach(tab => {
-      if (!tab.url) return;
-      const match = tab.url.match(/claude\.ai\/chat\/([a-f0-9-]+)/i);
-      if (match) openTabUuids.add(match[1]);
+      // pendingUrl covers tabs that are still loading when we scan.
+      const url = tab.url || tab.pendingUrl;
+      if (!url) { hidden++; return; }
+      const id = uuidFromUrl(url);
+      if (id) openTabUuids.add(id);
     });
-    console.log(`Found ${openTabUuids.size} open chat tab(s) in this window`);
+
+    // --- diagnostics (look for "[open-tabs]" in the console) ---
+    console.log(`[open-tabs] current window: ${tabs.length} tabs, ${hidden} with hidden/empty URL, ${openTabUuids.size} matched`);
+    if (tabs.length > 0 && hidden === tabs.length) {
+      console.warn('[open-tabs] Every tab URL is hidden → the "tabs" permission probably isn\'t active. Remove the extension and load it again (a plain reload sometimes isn\'t enough for new permissions).');
+    }
+    // Cross-check against all windows to catch the "chats are in another window" case.
+    const allTabs = await chrome.tabs.query({});
+    const allMatches = allTabs.filter(t => uuidFromUrl(t.url || t.pendingUrl)).length;
+    console.log(`[open-tabs] all windows: ${allTabs.length} tabs, ${allMatches} chat/viewer tabs total`);
+    if (allMatches > openTabUuids.size) {
+      console.warn(`[open-tabs] ${allMatches - openTabUuids.size} chat/viewer tab(s) are in OTHER windows — "open in this window" only counts the window the browse page is in.`);
+    }
   } catch (error) {
-    console.warn('Could not read open tabs:', error);
+    console.warn('[open-tabs] Could not read open tabs:', error);
   }
 }
 
@@ -568,9 +563,12 @@ function displayConversations() {
             <button class="btn-small btn-export" data-id="${conv.uuid}" data-name="${conv.name}">
               Export
             </button>
-            <button class="btn-small btn-view" data-id="${conv.uuid}">
+            <a class="btn-small btn-text" href="${chrome.runtime.getURL('view.html?id=' + conv.uuid)}" target="_blank" rel="noopener" title="View as plain text (Markdown export format)">
+              Text
+            </a>
+            <a class="btn-small btn-view" href="https://claude.ai/chat/${conv.uuid}" target="_blank" rel="noopener">
               View
-            </button>
+            </a>
           </div>
         </td>
       </tr>
@@ -591,14 +589,10 @@ function displayConversations() {
     });
   });
   
-  // Add view button listeners
-  document.querySelectorAll('.btn-view').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      const conversationId = e.target.dataset.id;
-      window.open(`https://claude.ai/chat/${conversationId}`, '_blank');
-    });
-  });
-  
+  // Text + View are now real <a> links (see displayConversations markup), so the
+  // browser handles normal-click (new tab), cmd/ctrl-click and middle-click
+  // (new background tab) natively — no JS listeners needed.
+
   // Enable bulk-action buttons now that there are results
   document.getElementById('exportAllBtn').disabled = false;
   document.getElementById('deleteAllBtn').disabled = false;
