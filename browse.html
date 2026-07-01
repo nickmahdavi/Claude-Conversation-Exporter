@@ -192,6 +192,8 @@
       border-radius: 8px;
       overflow: hidden;
       box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      /* Don't let drag-select highlight the row text. */
+      user-select: none;
     }
     
     table {
@@ -250,7 +252,17 @@
     tbody tr:hover {
       background: #f8f9fa;
     }
-    
+
+    /* Selected rows (file-manager style multi-select). More specific than
+       :hover so the selection color wins even while hovering. */
+    tbody tr.selected {
+      background: #d8e9ff;
+    }
+
+    tbody tr.selected:hover {
+      background: #cbe1ff;
+    }
+
     td {
       padding: 15px;
       font-size: 14px;
@@ -612,6 +624,43 @@
   </style>
   
   <div class="toast" id="toast"></div>
+
+  <!-- Floating selection action bar (appears when rows are selected) -->
+  <div class="selection-bar" id="selectionBar">
+    <span id="selectionCount">0 selected</span>
+    <button class="sel-btn sel-open" id="openSelectedBtn">Open as Text</button>
+    <button class="sel-btn sel-clear" id="clearSelectionBtn">Clear</button>
+  </div>
+  <style>
+    .selection-bar {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: none;
+      align-items: center;
+      gap: 12px;
+      background: #2b2b3a;
+      color: white;
+      padding: 10px 10px 10px 18px;
+      border-radius: 25px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+      z-index: 2500;
+      font-size: 14px;
+    }
+    .selection-bar.show { display: flex; }
+    .selection-bar .sel-btn {
+      border: none;
+      border-radius: 16px;
+      padding: 7px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .sel-open { background: #5436DA; color: white; }
+    .sel-open:hover { background: #4329B8; }
+    .sel-clear { background: rgba(255,255,255,0.15); color: white; }
+    .sel-clear:hover { background: rgba(255,255,255,0.28); }
+  </style>
   
   <!-- Progress modal for bulk export -->
   <div id="progressModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 3000;">

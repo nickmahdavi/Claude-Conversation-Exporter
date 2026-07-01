@@ -101,6 +101,101 @@ function saveToCache() {
   });
 }
 
+// --- Row selection (toggle-click accumulative; shift-range; drag adds range) ---
+let selectedUuids = new Set();        // selected conversation uuids
+let selectionAnchorIndex = null;      // anchor row index for shift-click ranges
+let isPointerDown = false;            // left button held over a row
+let pointerAnchorIndex = null;        // row index where the press started
+let dragMoved = false;                // pointer moved to another row → it's a drag
+let dragLastIndex = null;             // last row the drag reached (dedupe)
+let preDragSelection = null;          // selection snapshot to add the drag range onto
+let uuidToRow = new Map();            // uuid -> <tr> for cheap highlight updates
+let highlightedUuids = new Set();     // uuids currently shown highlighted in the DOM
+// Opening more than this many tabs at once asks for confirmation first.
+const OPEN_TABS_CONFIRM_THRESHOLD = 15;
+
+// Conversations that are both selected AND currently visible (post-filter).
+function getSelectedVisible() {
+  return filteredConversations.filter(c => selectedUuids.has(c.uuid));
+}
+
+// Targets for bulk actions: the selection if any is visible, else the whole
+// filtered list (preserves the original "acts on what you see" behavior).
+function getActionTargets() {
+  const selected = getSelectedVisible();
+  return selected.length ? selected : filteredConversations;
+}
+
+// Select the inclusive index range [from..to] in the current filtered order.
+// additive=false clears any prior selection first (shift / drag); true keeps it.
+function selectRange(from, to, additive) {
+  const lo = Math.min(from, to);
+  const hi = Math.max(from, to);
+  if (!additive) selectedUuids.clear();
+  for (let i = lo; i <= hi; i++) {
+    const conv = filteredConversations[i];
+    if (conv) selectedUuids.add(conv.uuid);
+  }
+}
+
+// Flip one row's selected state.
+function toggleRow(index) {
+  const uuid = filteredConversations[index]?.uuid;
+  if (!uuid) return;
+  if (selectedUuids.has(uuid)) selectedUuids.delete(uuid);
+  else selectedUuids.add(uuid);
+}
+
+// Push the current selection to the DOM by toggling only the rows that changed,
+// so dragging across a 7k-row table stays cheap.
+function applySelection() {
+  for (const uuid of selectedUuids) {
+    if (!highlightedUuids.has(uuid)) uuidToRow.get(uuid)?.classList.add('selected');
+  }
+  for (const uuid of highlightedUuids) {
+    if (!selectedUuids.has(uuid)) uuidToRow.get(uuid)?.classList.remove('selected');
+  }
+  highlightedUuids = new Set(selectedUuids);
+  updateSelectionBar();
+}
+
+function clearSelection() {
+  selectedUuids.clear();
+  selectionAnchorIndex = null;
+  applySelection();
+}
+
+// Show/hide the floating selection bar and keep the bulk-button labels in sync.
+function updateSelectionBar() {
+  const count = getSelectedVisible().length;
+  const bar = document.getElementById('selectionBar');
+  if (bar) {
+    document.getElementById('selectionCount').textContent =
+      `${count} selected`;
+    bar.classList.toggle('show', count > 0);
+  }
+  const exportBtn = document.getElementById('exportAllBtn');
+  const deleteBtn = document.getElementById('deleteAllBtn');
+  if (exportBtn) exportBtn.textContent = count ? `Export Selected (${count})` : 'Export All';
+  if (deleteBtn) deleteBtn.textContent = count ? `Delete Selected (${count})` : 'Delete Filtered';
+}
+
+// Open every selected conversation in the lightweight plaintext viewer, as
+// background tabs in this window (so they don't steal focus and the
+// "open in this window" filter can see them).
+function openSelectedAsText() {
+  const targets = getSelectedVisible();
+  if (!targets.length) return;
+  if (targets.length > OPEN_TABS_CONFIRM_THRESHOLD &&
+      !confirm(`Open ${targets.length} plaintext tabs in this window?`)) {
+    return;
+  }
+  targets.forEach(conv => {
+    chrome.tabs.create({ url: chrome.runtime.getURL('view.html?id=' + conv.uuid), active: false });
+  });
+  showToast(`Opened ${targets.length} tab${targets.length === 1 ? '' : 's'}`);
+}
+
 // Model name mappings
 const MODEL_DISPLAY_NAMES = {
   'claude-3-sonnet-20240229': 'Claude 3 Sonnet',
@@ -203,29 +298,14 @@ async function refreshOpenTabs() {
 
   try {
     const tabs = await chrome.tabs.query({ currentWindow: true });
-    let hidden = 0;
     tabs.forEach(tab => {
       // pendingUrl covers tabs that are still loading when we scan.
-      const url = tab.url || tab.pendingUrl;
-      if (!url) { hidden++; return; }
-      const id = uuidFromUrl(url);
+      const id = uuidFromUrl(tab.url || tab.pendingUrl);
       if (id) openTabUuids.add(id);
     });
-
-    // --- diagnostics (look for "[open-tabs]" in the console) ---
-    console.log(`[open-tabs] current window: ${tabs.length} tabs, ${hidden} with hidden/empty URL, ${openTabUuids.size} matched`);
-    if (tabs.length > 0 && hidden === tabs.length) {
-      console.warn('[open-tabs] Every tab URL is hidden → the "tabs" permission probably isn\'t active. Remove the extension and load it again (a plain reload sometimes isn\'t enough for new permissions).');
-    }
-    // Cross-check against all windows to catch the "chats are in another window" case.
-    const allTabs = await chrome.tabs.query({});
-    const allMatches = allTabs.filter(t => uuidFromUrl(t.url || t.pendingUrl)).length;
-    console.log(`[open-tabs] all windows: ${allTabs.length} tabs, ${allMatches} chat/viewer tabs total`);
-    if (allMatches > openTabUuids.size) {
-      console.warn(`[open-tabs] ${allMatches - openTabUuids.size} chat/viewer tab(s) are in OTHER windows — "open in this window" only counts the window the browse page is in.`);
-    }
+    console.log(`Found ${openTabUuids.size} open chat tab(s) in this window`);
   } catch (error) {
-    console.warn('[open-tabs] Could not read open tabs:', error);
+    console.warn('Could not read open tabs:', error);
   }
 }
 
@@ -514,6 +594,9 @@ function displayConversations() {
     tableContent.innerHTML = '<div class="no-results">No conversations found</div>';
     document.getElementById('exportAllBtn').disabled = true;
     document.getElementById('deleteAllBtn').disabled = true;
+    uuidToRow = new Map();
+    highlightedUuids = new Set();
+    updateSelectionBar(); // nothing visible → bar hides, labels reset
     return;
   }
   
@@ -532,13 +615,14 @@ function displayConversations() {
       <tbody>
   `;
   
-  filteredConversations.forEach(conv => {
+  filteredConversations.forEach((conv, i) => {
     const updatedDate = new Date(conv.updated_at).toLocaleDateString();
     const createdDate = new Date(conv.created_at).toLocaleDateString();
     const modelBadgeClass = getModelBadgeClass(conv.model);
-    
+    const selectedClass = selectedUuids.has(conv.uuid) ? ' selected' : '';
+
     html += `
-      <tr data-id="${conv.uuid}">
+      <tr class="conv-row${selectedClass}" data-id="${conv.uuid}" data-index="${i}">
         <td>
           <div class="conversation-name">
             <a href="https://claude.ai/chat/${conv.uuid}" target="_blank" title="${conv.name}">
@@ -581,17 +665,30 @@ function displayConversations() {
   `;
   
   tableContent.innerHTML = html;
-  
+
+  // Rebuild the uuid -> row map for selection highlighting, and re-apply the
+  // current selection to the freshly rendered rows. The drag/shift anchor is
+  // reset because row indices only mean something within one render.
+  uuidToRow = new Map();
+  highlightedUuids = new Set();
+  tableContent.querySelectorAll('tr[data-id]').forEach(row => {
+    uuidToRow.set(row.dataset.id, row);
+    if (selectedUuids.has(row.dataset.id)) highlightedUuids.add(row.dataset.id);
+  });
+  selectionAnchorIndex = null;
+  updateSelectionBar();
+
   // Add export button listeners
   document.querySelectorAll('.btn-export').forEach(btn => {
     btn.addEventListener('click', (e) => {
       exportConversation(e.target.dataset.id, e.target.dataset.name);
     });
   });
-  
+
   // Text + View are now real <a> links (see displayConversations markup), so the
   // browser handles normal-click (new tab), cmd/ctrl-click and middle-click
-  // (new background tab) natively — no JS listeners needed.
+  // (new background tab) natively — no JS listeners needed. Row selection is
+  // handled by delegated listeners attached once in setupEventListeners.
 
   // Enable bulk-action buttons now that there are results
   document.getElementById('exportAllBtn').disabled = false;
@@ -685,7 +782,9 @@ async function exportAllFiltered() {
   try {
     // Create a new ZIP file
     const zip = new JSZip();
-    const total = filteredConversations.length;
+    // Act on the selection if there is one, else the whole filtered list.
+    const targets = getActionTargets();
+    const total = targets.length;
     let completed = 0;
     let failed = 0;
     const failedConversations = [];
@@ -709,7 +808,7 @@ async function exportAllFiltered() {
     for (let i = 0; i < total; i += batchSize) {
       if (cancelExport) break;
       
-      const batch = filteredConversations.slice(i, Math.min(i + batchSize, total));
+      const batch = targets.slice(i, Math.min(i + batchSize, total));
       const promises = batch.map(async (conv) => {
         try {
           const response = await fetch(
@@ -839,9 +938,11 @@ async function exportAllFiltered() {
   }
 }
 
-// Open the type-to-confirm modal for deleting the currently filtered conversations.
+// Open the type-to-confirm modal for deleting the target conversations
+// (the selection if any, else everything matching the current filters).
 function openDeleteModal() {
-  const total = filteredConversations.length;
+  const targets = getActionTargets();
+  const total = targets.length;
   if (total === 0) return;
 
   const modal = document.getElementById('deleteModal');
@@ -850,12 +951,13 @@ function openDeleteModal() {
   const input = document.getElementById('deleteConfirmInput');
   const confirmBtn = document.getElementById('deleteConfirm');
 
+  const scope = getSelectedVisible().length ? 'your selection' : 'everything currently shown by your filters';
   warning.innerHTML =
     `You are about to permanently delete <strong>${total}</strong> ` +
-    `conversation${total === 1 ? '' : 's'} (everything currently shown by your filters).`;
+    `conversation${total === 1 ? '' : 's'} (${scope}).`;
 
   // Show up to 8 names so the user can sanity-check the selection.
-  const names = filteredConversations.slice(0, 8).map(c => `• ${escapeHtml(c.name || '(untitled)')}`);
+  const names = targets.slice(0, 8).map(c => `• ${escapeHtml(c.name || '(untitled)')}`);
   if (total > 8) names.push(`…and ${total - 8} more`);
   sample.innerHTML = names.join('<br>');
 
@@ -879,7 +981,7 @@ function closeDeleteModal() {
 async function performDelete() {
   closeDeleteModal();
 
-  const targets = [...filteredConversations];
+  const targets = getActionTargets();
   const total = targets.length;
 
   const progressModal = document.getElementById('progressModal');
@@ -943,8 +1045,9 @@ async function performDelete() {
       }
     }
 
-    // Drop deleted conversations from local state and refresh the view.
+    // Drop deleted conversations from local state and selection, then refresh.
     allConversations = allConversations.filter(c => !deletedUuids.has(c.uuid));
+    deletedUuids.forEach(u => selectedUuids.delete(u));
     populateProjectFilter();
     applyFiltersAndSort();
 
@@ -1076,4 +1179,94 @@ function setupEventListeners() {
 
   // Keep the "updated Xm ago" label from going stale while the page sits open.
   setInterval(() => updateCacheStatus(), 60 * 1000);
+
+  setupSelectionHandlers();
+}
+
+// Row selection: click / shift-click range / cmd-toggle / click-and-drag.
+// Listeners are delegated onto #tableContent once (the table HTML is re-rendered
+// in place, so the container element persists across renders).
+function setupSelectionHandlers() {
+  const tableContent = document.getElementById('tableContent');
+
+  // Resolve an event target to its row index, or null if the click landed on an
+  // interactive element (link/button) — those keep their own behavior.
+  const rowIndexFromEvent = (e) => {
+    if (e.target.closest('a, button')) return null;
+    const row = e.target.closest('tr[data-index]');
+    return row ? parseInt(row.dataset.index, 10) : null;
+  };
+
+  tableContent.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return; // left button only
+    const index = rowIndexFromEvent(e);
+    if (index === null) return;
+
+    e.preventDefault(); // suppress native text selection while (drag-)selecting
+
+    if (e.shiftKey && selectionAnchorIndex !== null) {
+      // Shift-click: add the contiguous range from the anchor to the selection.
+      selectRange(selectionAnchorIndex, index, true);
+      applySelection();
+      return;
+    }
+
+    if (e.metaKey || e.ctrlKey) {
+      // Same as a plain click now (toggle), but never starts a drag.
+      toggleRow(index);
+      selectionAnchorIndex = index;
+      applySelection();
+      return;
+    }
+
+    // Plain press: defer the decision. A press-without-move is a toggle (handled
+    // on mouseup); a press-then-move becomes a drag that ADDS the swept range.
+    isPointerDown = true;
+    pointerAnchorIndex = index;
+    selectionAnchorIndex = index;
+    dragMoved = false;
+    dragLastIndex = index;
+    preDragSelection = new Set(selectedUuids);
+  });
+
+  // Turn a press-and-move into an additive range drag (grows/shrinks live off
+  // the pre-drag snapshot, so backtracking works).
+  tableContent.addEventListener('mouseover', (e) => {
+    if (!isPointerDown) return;
+    const row = e.target.closest('tr[data-index]');
+    if (!row) return;
+    const index = parseInt(row.dataset.index, 10);
+    if (index === dragLastIndex) return;
+    dragLastIndex = index;
+    dragMoved = true;
+    selectedUuids = new Set(preDragSelection);
+    selectRange(pointerAnchorIndex, index, true);
+    applySelection();
+  });
+
+  document.addEventListener('mouseup', () => {
+    // A plain press that never moved = a click = toggle that one row.
+    if (isPointerDown && !dragMoved) {
+      toggleRow(pointerAnchorIndex);
+      applySelection();
+    }
+    isPointerDown = false;
+    dragMoved = false;
+    dragLastIndex = null;
+    preDragSelection = null;
+  });
+
+  // Esc: close the delete modal if open, otherwise deselect everything.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const modal = document.getElementById('deleteModal');
+    if (modal && modal.style.display === 'block') { closeDeleteModal(); return; }
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    clearSelection();
+  });
+
+  // Selection bar actions
+  document.getElementById('openSelectedBtn').addEventListener('click', openSelectedAsText);
+  document.getElementById('clearSelectionBtn').addEventListener('click', clearSelection);
 }
