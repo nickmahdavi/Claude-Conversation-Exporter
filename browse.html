@@ -231,6 +231,44 @@
       color: white;
     }
 
+    /* Split-style "add to project" control: dropdown joined to an Add button. */
+    .assign-project {
+      display: inline-flex;
+    }
+
+    .assign-project select {
+      padding: 10px 8px;
+      max-width: 170px;
+      border: 1px solid #5436DA;
+      border-right: none;
+      border-radius: 5px 0 0 5px;
+      background: white;
+      color: #5436DA;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    .assign-project button {
+      padding: 10px 16px;
+      border: 1px solid #5436DA;
+      border-radius: 0 5px 5px 0;
+      background: #5436DA;
+      color: white;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .assign-project button:hover:not(:disabled) {
+      background: #4329B8;
+    }
+
+    .assign-project button:disabled {
+      background: #ccc;
+      border-color: #ccc;
+      cursor: not-allowed;
+    }
+
     .container {
       max-width: 1400px;
       margin: 20px auto;
@@ -623,6 +661,13 @@
       <button class="select-open-btn" id="selectOpenBtn" title="Select the conversations open in tabs in this window (that are visible here)">
         Select Open
       </button>
+
+      <div class="assign-project" title="Add the selected (or filtered) conversations to a project">
+        <select id="assignProjectSelect">
+          <option value="">Add to project…</option>
+        </select>
+        <button id="assignProjectBtn" disabled>Add</button>
+      </div>
 
       <button class="delete-all-btn" id="deleteAllBtn" disabled title="Permanently delete all conversations currently shown">
         Delete Filtered

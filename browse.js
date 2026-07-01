@@ -374,6 +374,104 @@ function populateProjectFilter() {
   if ([...select.options].some(o => o.value === previous)) {
     select.value = previous;
   }
+
+  populateAssignProjectSelect();
+}
+
+// Populate the "add to project" dropdown with ALL known projects (not just ones
+// already used), so you can add conversations to any project.
+function populateAssignProjectSelect() {
+  const select = document.getElementById('assignProjectSelect');
+  if (!select) return;
+  const previous = select.value;
+
+  const entries = Object.entries(projectMap)
+    .map(([uuid, name]) => ({ uuid, name }))
+    .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+
+  select.innerHTML =
+    '<option value="">Add to project…</option>' +
+    entries.map(e => `<option value="${e.uuid}">${escapeHtml(e.name)}</option>`).join('');
+
+  if ([...select.options].some(o => o.value === previous)) {
+    select.value = previous;
+  }
+  const btn = document.getElementById('assignProjectBtn');
+  if (btn) btn.disabled = !select.value;
+}
+
+// Number of conversations to move per move_many call — the endpoint is bulk, but
+// we chunk to keep individual requests reasonable.
+const MOVE_CHUNK_SIZE = 100;
+
+// Move a batch of conversations into a project via the bulk move_many endpoint.
+// Verified request shape (from DevTools):
+//   POST /api/organizations/{org}/chat_conversations/move_many
+//   { "conversation_uuids": [...], "project_uuid": "..." }
+async function moveConversationsToProject(convUuids, projectUuid) {
+  const response = await fetch(
+    `https://claude.ai/api/organizations/${orgId}/chat_conversations/move_many`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ conversation_uuids: convUuids, project_uuid: projectUuid })
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+}
+
+// Bulk-add the target conversations (selection, else filtered) to the project
+// chosen in the dropdown, after a confirm. Chunked; updates local state + cache.
+async function assignSelectedToProject() {
+  const select = document.getElementById('assignProjectSelect');
+  const projectUuid = select.value;
+  if (!projectUuid) return;
+  const projectName = projectMap[projectUuid] || '(project)';
+
+  // Skip conversations already in the target project.
+  const targets = getActionTargets().filter(c => c.projectUuid !== projectUuid);
+  if (!targets.length) {
+    showToast('Nothing to add (or all already in that project).', true);
+    return;
+  }
+  if (!confirm(`Add ${targets.length} conversation${targets.length === 1 ? '' : 's'} to “${projectName}”?`)) {
+    return;
+  }
+
+  const btn = document.getElementById('assignProjectBtn');
+  btn.disabled = true;
+  showToast(`Adding ${targets.length} to “${projectName}”…`);
+
+  let ok = 0;
+  let failed = 0;
+  for (let i = 0; i < targets.length; i += MOVE_CHUNK_SIZE) {
+    const chunk = targets.slice(i, i + MOVE_CHUNK_SIZE);
+    try {
+      await moveConversationsToProject(chunk.map(c => c.uuid), projectUuid);
+      chunk.forEach(c => { c.projectUuid = projectUuid; c.projectName = projectName; });
+      ok += chunk.length;
+    } catch (error) {
+      console.error('move_many failed for a chunk:', error);
+      failed += chunk.length;
+    }
+    if (i + MOVE_CHUNK_SIZE < targets.length) {
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+  }
+
+  populateProjectFilter();
+  applyFiltersAndSort();
+  saveToCache();
+  btn.disabled = !select.value;
+
+  if (failed > 0) {
+    showToast(`Added ${ok} to “${projectName}” (${failed} failed). See console for details.`, true);
+  } else {
+    showToast(`Added ${ok} to “${projectName}”.`);
+  }
 }
 
 // Fetch the raw conversation list from the API (throws on failure).
@@ -1232,6 +1330,12 @@ function setupEventListeners() {
 
   // Select the open conversations that are visible in the current view.
   document.getElementById('selectOpenBtn').addEventListener('click', selectOpen);
+
+  // Add-to-project: enable the button once a project is chosen; confirm on click.
+  document.getElementById('assignProjectSelect').addEventListener('change', (e) => {
+    document.getElementById('assignProjectBtn').disabled = !e.target.value;
+  });
+  document.getElementById('assignProjectBtn').addEventListener('click', assignSelectedToProject);
 
   // Delete filtered conversations (type-to-confirm)
   document.getElementById('deleteAllBtn').addEventListener('click', openDeleteModal);
