@@ -215,6 +215,22 @@
       cursor: not-allowed;
     }
 
+    .select-open-btn {
+      padding: 10px 20px;
+      background: white;
+      color: #5436DA;
+      border: 1px solid #5436DA;
+      border-radius: 5px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .select-open-btn:hover {
+      background: #5436DA;
+      color: white;
+    }
+
     .container {
       max-width: 1400px;
       margin: 20px auto;
@@ -547,13 +563,6 @@
         </select>
       </div>
 
-      <div class="filter-group">
-        <label title="Only show chats currently open in tabs in this Chrome window">
-          <input type="checkbox" id="openTabsOnly">
-          Open in this window
-        </label>
-        <button id="refreshOpenTabs" class="clear-dates-btn" title="Re-scan open tabs in this window">⟳</button>
-      </div>
 
       <div class="filter-group">
         <label>Created:</label>
@@ -609,6 +618,10 @@
 
       <button class="export-all-btn" id="exportAllBtn" disabled>
         Export All
+      </button>
+
+      <button class="select-open-btn" id="selectOpenBtn" title="Select the conversations open in tabs in this window (that are visible here)">
+        Select Open
       </button>
 
       <button class="delete-all-btn" id="deleteAllBtn" disabled title="Permanently delete all conversations currently shown">

@@ -6,9 +6,12 @@ let currentSort = 'updated_desc';
 
 // Maps project uuid -> project name, populated from the /projects endpoint.
 let projectMap = {};
-// UUIDs of conversations currently open in tabs in THIS Chrome window.
-// Populated on demand via chrome.tabs.query (see refreshOpenTabs).
+// Conversations currently open in tabs in THIS Chrome window, populated on
+// demand via chrome.tabs.query (see refreshOpenTabs). openTabUuids is the set of
+// open conversation uuids; openTabsByUuid maps uuid -> [tabId, …] so we can close
+// a conversation's tab(s) when it's deleted.
 let openTabUuids = new Set();
+let openTabsByUuid = new Map();
 // The exact phrase the user must type to confirm a delete, e.g. "DELETE 42".
 // Set per-open in openDeleteModal so it reflects the current count.
 let deleteConfirmPhrase = 'DELETE';
@@ -221,7 +224,6 @@ const MODEL_DISPLAY_NAMES = {
 document.addEventListener('DOMContentLoaded', async () => {
   await loadOrgId();
   setupEventListeners();
-  await refreshOpenTabs();
   if (!orgId) return;
 
   // Stale-while-revalidate: render instantly from cache, then refresh only if stale.
@@ -279,10 +281,12 @@ function getProjectUuid(conv) {
   return conv.project_uuid || (conv.project && conv.project.uuid) || null;
 }
 
-// Re-scan tabs in the CURRENT Chrome window and collect the conversation UUIDs
-// of any open claude.ai/chat/<uuid> pages. Used by the "open in this window" filter.
+// Re-scan tabs in the CURRENT Chrome window and record which conversations are
+// open (both the set of uuids and a uuid -> [tabId] map). Used by "Select Open"
+// and by delete (to close a deleted conversation's tabs).
 async function refreshOpenTabs() {
   openTabUuids = new Set();
+  openTabsByUuid = new Map();
   if (!chrome.tabs || !chrome.tabs.query) return;
 
   // Pull a uuid out of either a live chat URL or our viewer URL; null otherwise.
@@ -301,11 +305,43 @@ async function refreshOpenTabs() {
     tabs.forEach(tab => {
       // pendingUrl covers tabs that are still loading when we scan.
       const id = uuidFromUrl(tab.url || tab.pendingUrl);
-      if (id) openTabUuids.add(id);
+      if (!id) return;
+      openTabUuids.add(id);
+      if (!openTabsByUuid.has(id)) openTabsByUuid.set(id, []);
+      openTabsByUuid.get(id).push(tab.id);
     });
     console.log(`Found ${openTabUuids.size} open chat tab(s) in this window`);
   } catch (error) {
     console.warn('Could not read open tabs:', error);
+  }
+}
+
+// Select every conversation currently visible in the view that is also open in a
+// tab in this window (additive — adds to the current selection). Re-scans first.
+async function selectOpen() {
+  await refreshOpenTabs();
+  const openVisible = filteredConversations.filter(c => openTabUuids.has(c.uuid));
+  openVisible.forEach(c => selectedUuids.add(c.uuid));
+  applySelection();
+  showToast(openVisible.length
+    ? `Selected ${openVisible.length} open conversation${openVisible.length === 1 ? '' : 's'} in view.`
+    : 'No open conversations in the current view.');
+}
+
+// Close any tabs in this window showing the given conversations. Relies on the
+// openTabsByUuid map (call refreshOpenTabs first for an up-to-date snapshot).
+async function closeTabsForConversations(convs) {
+  if (!chrome.tabs || !chrome.tabs.remove) return;
+  const tabIds = [];
+  convs.forEach(conv => {
+    const ids = openTabsByUuid.get(conv.uuid);
+    if (ids) tabIds.push(...ids);
+  });
+  if (!tabIds.length) return;
+  try {
+    await chrome.tabs.remove(tabIds);
+  } catch (error) {
+    console.warn('Could not close some tabs:', error);
   }
 }
 
@@ -492,7 +528,6 @@ function applyFiltersAndSort() {
   const searchTerm = document.getElementById('searchInput').value.toLowerCase();
   const modelFilter = document.getElementById('modelFilter').value;
   const projectFilter = document.getElementById('projectFilter').value;
-  const openTabsOnly = document.getElementById('openTabsOnly').checked;
 
   // Validate date ranges first; invalid (start > end) ranges are ignored
   // so the list never silently shows wrong/empty results.
@@ -536,14 +571,11 @@ function applyFiltersAndSort() {
       matchesProject = conv.projectUuid === projectFilter;
     }
 
-    // Only chats open in a tab in this window (snapshot from refreshOpenTabs).
-    const matchesOpenTab = !openTabsOnly || openTabUuids.has(conv.uuid);
-
     const matchesCreated = inRange(new Date(conv.created_at).getTime(), created);
     const matchesUpdated = inRange(new Date(conv.updated_at).getTime(), updated);
 
     return matchesSearch && matchesModel && matchesProject &&
-           matchesOpenTab && matchesCreated && matchesUpdated;
+           matchesCreated && matchesUpdated;
   });
   
   // Sort conversations
@@ -990,12 +1022,19 @@ let deleteDone = 0;              // succeeded so far this run
 let deleteFailed = 0;            // failed so far this run
 const enqueuedUuids = new Set(); // queued/in-flight — used to dedupe re-adds
 
-// Confirm handler: queue the target conversations for background deletion.
-function performDelete() {
+// Confirm handler: queue the target conversations for background deletion, and
+// close any tabs in this window that are showing them.
+async function performDelete() {
   closeDeleteModal();
   const targets = getActionTargets();
   if (!targets.length) return;
-  enqueueDeletes([...targets]);
+  const toDelete = [...targets];
+
+  // Close the deleted conversations' open tabs (fresh scan first).
+  await refreshOpenTabs();
+  await closeTabsForConversations(toDelete);
+
+  enqueueDeletes(toDelete);
 }
 
 // Queue conversations for deletion and remove them from the list + cache right
@@ -1164,18 +1203,8 @@ function setupEventListeners() {
   // Project filter
   document.getElementById('projectFilter').addEventListener('change', applyFiltersAndSort);
 
-  // "Open in this window" filter — re-scan tabs when toggled on so it's fresh.
-  document.getElementById('openTabsOnly').addEventListener('change', async (e) => {
-    if (e.target.checked) await refreshOpenTabs();
-    applyFiltersAndSort();
-  });
-
-  // Manual re-scan of open tabs
-  document.getElementById('refreshOpenTabs').addEventListener('click', async () => {
-    await refreshOpenTabs();
-    showToast(`Found ${openTabUuids.size} open chat tab(s) in this window`);
-    applyFiltersAndSort();
-  });
+  // Select the open conversations that are visible in the current view.
+  document.getElementById('selectOpenBtn').addEventListener('click', selectOpen);
 
   // Delete filtered conversations (type-to-confirm)
   document.getElementById('deleteAllBtn').addEventListener('click', openDeleteModal);
