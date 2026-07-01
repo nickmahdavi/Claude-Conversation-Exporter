@@ -15,6 +15,10 @@ let openTabsByUuid = new Map();
 // The exact phrase the user must type to confirm a delete, e.g. "DELETE 42".
 // Set per-open in openDeleteModal so it reflects the current count.
 let deleteConfirmPhrase = 'DELETE';
+// Snapshot of the conversations shown in the delete modal, taken when it opens.
+// performDelete acts on this snapshot — never on a recomputed target list — so a
+// background refresh landing while the modal is open can't change what gets deleted.
+let pendingDeleteTargets = null;
 
 // --- Conversation list caching (stale-while-revalidate) ---
 // Bump CACHE_VERSION whenever the cached object shape changes, to invalidate
@@ -364,7 +368,7 @@ function populateProjectFilter() {
     '<option value="">All Projects</option>' +
     '<option value="__none__">No project</option>' +
     '<option value="__any__">Any project</option>' +
-    entries.map(e => `<option value="${e.uuid}">${e.name}</option>`).join('');
+    entries.map(e => `<option value="${escapeHtml(e.uuid)}">${escapeHtml(e.name)}</option>`).join('');
 
   // Restore previous selection if the option still exists.
   if ([...select.options].some(o => o.value === previous)) {
@@ -413,7 +417,11 @@ async function revalidate(isInitial = false) {
     if (!isInitial) updateCacheStatus('refreshing');
     await loadProjects();
     const raw = await fetchConversationList();
-    const resolved = resolveConversations(raw);
+    // Drop conversations that are queued/in-flight for deletion: the server
+    // still lists them, and letting them back in would undo the optimistic
+    // removal mid-delete (failures get restored by the worker anyway).
+    const resolved = resolveConversations(raw)
+      .filter(c => !enqueuedUuids.has(c.uuid));
     const sig = signatureOf(resolved);
 
     // Only touch the DOM when something actually changed — avoids flicker/scroll
@@ -555,7 +563,7 @@ function applyFiltersAndSort() {
   // Filter conversations
   filteredConversations = allConversations.filter(conv => {
     const matchesSearch = !searchTerm ||
-      conv.name.toLowerCase().includes(searchTerm) ||
+      (conv.name || '').toLowerCase().includes(searchTerm) ||
       (conv.summary && conv.summary.toLowerCase().includes(searchTerm));
 
     const matchesModel = !modelFilter || conv.model === modelFilter;
@@ -595,8 +603,8 @@ function sortConversations() {
     
     switch (field) {
       case 'name':
-        aVal = a.name.toLowerCase();
-        bVal = b.name.toLowerCase();
+        aVal = (a.name || '').toLowerCase();
+        bVal = (b.name || '').toLowerCase();
         break;
       case 'created':
         aVal = new Date(a.created_at);
@@ -652,13 +660,14 @@ function displayConversations() {
     const createdDate = new Date(conv.created_at).toLocaleDateString();
     const modelBadgeClass = getModelBadgeClass(conv.model);
     const selectedClass = selectedUuids.has(conv.uuid) ? ' selected' : '';
+    const safeName = escapeHtml(conv.name || '(untitled)');
 
     html += `
       <tr class="conv-row${selectedClass}" data-id="${conv.uuid}" data-index="${i}">
         <td>
           <div class="conversation-name">
-            <a href="https://claude.ai/chat/${conv.uuid}" target="_blank" title="${conv.name}">
-              ${conv.name}
+            <a href="https://claude.ai/chat/${conv.uuid}" target="_blank" title="${safeName}">
+              ${safeName}
             </a>
           </div>
         </td>
@@ -666,7 +675,7 @@ function displayConversations() {
         <td class="date">${createdDate}</td>
         <td>
           <span class="model-badge ${modelBadgeClass}">
-            ${formatModelName(conv.model)}
+            ${escapeHtml(formatModelName(conv.model))}
           </span>
         </td>
         <td>
@@ -676,7 +685,7 @@ function displayConversations() {
         </td>
         <td>
           <div class="actions">
-            <button class="btn-small btn-export" data-id="${conv.uuid}" data-name="${conv.name}">
+            <button class="btn-small btn-export" data-id="${conv.uuid}" data-name="${escapeHtml(conv.name || '')}">
               Export
             </button>
             <a class="btn-small btn-text" href="${chrome.runtime.getURL('view.html?id=' + conv.uuid)}" target="_blank" rel="noopener" title="View as plain text (Markdown export format)">
@@ -757,25 +766,26 @@ async function exportConversation(conversationId, conversationName) {
     }
     
     const data = await response.json();
-    
+
     // Infer model if null
     data.model = inferModel(data);
-    
+
+    const safeName = (conversationName || conversationId).replace(/[<>:"/\\|?*]/g, '_');
     let content, filename, type;
     switch (format) {
       case 'markdown':
         content = convertToMarkdown(data, includeMetadata);
-        filename = `claude-${conversationName || conversationId}.md`;
+        filename = `claude-${safeName}.md`;
         type = 'text/markdown';
         break;
       case 'text':
         content = convertToText(data, includeMetadata);
-        filename = `claude-${conversationName || conversationId}.txt`;
+        filename = `claude-${safeName}.txt`;
         type = 'text/plain';
         break;
       default:
         content = JSON.stringify(data, null, 2);
-        filename = `claude-${conversationName || conversationId}.json`;
+        filename = `claude-${safeName}.json`;
         type = 'application/json';
     }
     
@@ -834,6 +844,10 @@ async function exportAllFiltered() {
       : 25;
     const interBatchDelayMs = 150;
 
+    // Filenames already used in the ZIP — duplicates get a uuid suffix instead
+    // of silently overwriting an earlier entry (zip.file replaces same names).
+    const usedFilenames = new Set();
+
     // Time just the fetch phase (excludes ZIP creation) so batch-size tuning
     // measures the thing it actually affects.
     const fetchStart = performance.now();
@@ -863,23 +877,31 @@ async function exportAllFiltered() {
           data.model = inferModel(data);
           
           // Generate filename and content based on format
-          let content, filename;
-          const safeName = conv.name.replace(/[<>:"/\\|?*]/g, '_'); // Remove invalid filename characters
-          
+          let content, ext;
+          const safeName = (conv.name || conv.uuid).replace(/[<>:"/\\|?*]/g, '_'); // Remove invalid filename characters
+
           switch (format) {
             case 'markdown':
               content = convertToMarkdown(data, includeMetadata);
-              filename = `${safeName}.md`;
+              ext = '.md';
               break;
             case 'text':
               content = convertToText(data, includeMetadata);
-              filename = `${safeName}.txt`;
+              ext = '.txt';
               break;
             default: // json
               content = JSON.stringify(data, null, 2);
-              filename = `${safeName}.json`;
+              ext = '.json';
           }
-          
+
+          // Disambiguate duplicate names (no await between check and add, so
+          // concurrent exports in the batch can't race this).
+          let filename = `${safeName}${ext}`;
+          if (usedFilenames.has(filename)) {
+            filename = `${safeName} (${conv.uuid.slice(0, 8)})${ext}`;
+          }
+          usedFilenames.add(filename);
+
           // Add file to ZIP
           zip.file(filename, content);
           completed++;
@@ -966,7 +988,7 @@ async function exportAllFiltered() {
     showToast(`Export failed: ${error.message}`, true);
   } finally {
     button.disabled = false;
-    button.textContent = 'Export All';
+    updateSelectionBar(); // restores "Export All" / "Export Selected (n)" as appropriate
   }
 }
 
@@ -976,6 +998,7 @@ function openDeleteModal() {
   const targets = getActionTargets();
   const total = targets.length;
   if (total === 0) return;
+  pendingDeleteTargets = [...targets];
 
   const modal = document.getElementById('deleteModal');
   const warning = document.getElementById('deleteWarning');
@@ -1022,19 +1045,18 @@ let deleteDone = 0;              // succeeded so far this run
 let deleteFailed = 0;            // failed so far this run
 const enqueuedUuids = new Set(); // queued/in-flight — used to dedupe re-adds
 
-// Confirm handler: queue the target conversations for background deletion, and
-// close any tabs in this window that are showing them.
+// Confirm handler: queue the snapshotted target conversations for background
+// deletion. Their open tabs are closed by the worker as each delete succeeds.
 async function performDelete() {
+  const targets = pendingDeleteTargets || [];
+  pendingDeleteTargets = null;
   closeDeleteModal();
-  const targets = getActionTargets();
   if (!targets.length) return;
-  const toDelete = [...targets];
 
-  // Close the deleted conversations' open tabs (fresh scan first).
+  // Snapshot open tabs now so the worker can close each conversation's tab(s)
+  // once its deletion actually goes through.
   await refreshOpenTabs();
-  await closeTabsForConversations(toDelete);
-
-  enqueueDeletes(toDelete);
+  enqueueDeletes(targets);
 }
 
 // Queue conversations for deletion and remove them from the list + cache right
@@ -1103,6 +1125,7 @@ async function runDeleteWorker() {
 
   while (deleteQueue.length > 0 && !deleteCancelled) {
     const batch = deleteQueue.splice(0, DELETE_BATCH_SIZE);
+    const succeeded = [];
     await Promise.all(batch.map(async (conv) => {
       try {
         const response = await fetch(
@@ -1114,12 +1137,16 @@ async function runDeleteWorker() {
           throw new Error(`HTTP ${response.status}`);
         }
         deleteDone++;
+        succeeded.push(conv);
       } catch (error) {
         console.error(`Failed to delete ${conv.name}:`, error);
         deleteFailed++;
         restore.push(conv); // wasn't deleted → bring it back
       }
     }));
+    // Only close tabs for conversations that are actually gone — a failed
+    // delete is restored to the list and keeps its tab.
+    await closeTabsForConversations(succeeded);
     updateDeleteStatus();
     if (deleteQueue.length > 0 && !deleteCancelled) {
       await new Promise(resolve => setTimeout(resolve, DELETE_INTER_BATCH_MS));

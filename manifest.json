@@ -24,7 +24,7 @@
       "content_scripts": [
     {
       "matches": ["https://claude.ai/*"],
-      "js": ["content.js"],
+      "js": ["utils.js", "content.js"],
       "css": ["content.css"]
     }
   ],
@@ -36,11 +36,5 @@
     "48": "icon48.png",
     "128": "icon128.png"
   },
-  "options_page": "options.html",
-  "web_accessible_resources": [
-    {
-      "resources": ["browse.html", "view.html"],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  "options_page": "options.html"
   }
