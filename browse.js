@@ -390,14 +390,24 @@ function populateAssignProjectSelect() {
     .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 
   select.innerHTML =
-    '<option value="">Add to project…</option>' +
-    entries.map(e => `<option value="${e.uuid}">${escapeHtml(e.name)}</option>`).join('');
+    '<option value="">Choose project…</option>' +
+    entries.map(e => `<option value="${escapeHtml(e.uuid)}">${escapeHtml(e.name)}</option>`).join('');
 
   if ([...select.options].some(o => o.value === previous)) {
     select.value = previous;
   }
+  updateAssignButtonLabel();
+}
+
+// Reflect the chosen project on the Add button ("Add to <name>") and toggle it.
+function updateAssignButtonLabel() {
+  const select = document.getElementById('assignProjectSelect');
   const btn = document.getElementById('assignProjectBtn');
-  if (btn) btn.disabled = !select.value;
+  if (!select || !btn) return;
+  const name = select.value ? (projectMap[select.value] || 'project') : '';
+  btn.textContent = name ? `Add to ${name}` : 'Add to project…';
+  btn.title = name ? `Add the selected (or filtered) conversations to “${name}”` : '';
+  btn.disabled = !select.value;
 }
 
 // Number of conversations to move per move_many call — the endpoint is bulk, but
@@ -1332,9 +1342,7 @@ function setupEventListeners() {
   document.getElementById('selectOpenBtn').addEventListener('click', selectOpen);
 
   // Add-to-project: enable the button once a project is chosen; confirm on click.
-  document.getElementById('assignProjectSelect').addEventListener('change', (e) => {
-    document.getElementById('assignProjectBtn').disabled = !e.target.value;
-  });
+  document.getElementById('assignProjectSelect').addEventListener('change', updateAssignButtonLabel);
   document.getElementById('assignProjectBtn').addEventListener('click', assignSelectedToProject);
 
   // Delete filtered conversations (type-to-confirm)

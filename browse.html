@@ -232,31 +232,27 @@
     }
 
     /* Split-style "add to project" control: dropdown joined to an Add button. */
+    /* Split control: the project-name text IS the "Add" button (left), with a
+       caret (right) that opens a project chooser (a transparent native <select>
+       overlays the caret). */
     .assign-project {
       display: inline-flex;
-    }
-
-    .assign-project select {
-      padding: 10px 8px;
-      max-width: 170px;
-      border: 1px solid #5436DA;
-      border-right: none;
-      border-radius: 5px 0 0 5px;
-      background: white;
-      color: #5436DA;
-      font-size: 14px;
-      cursor: pointer;
+      align-items: stretch;
     }
 
     .assign-project button {
+      max-width: 220px;
       padding: 10px 16px;
       border: 1px solid #5436DA;
-      border-radius: 0 5px 5px 0;
+      border-radius: 5px 0 0 5px;
       background: #5436DA;
       color: white;
       font-size: 14px;
       cursor: pointer;
       transition: background 0.2s;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .assign-project button:hover:not(:disabled) {
@@ -267,6 +263,35 @@
       background: #ccc;
       border-color: #ccc;
       cursor: not-allowed;
+    }
+
+    .assign-caret {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      border: 1px solid #5436DA;
+      border-left: none;
+      border-radius: 0 5px 5px 0;
+      background: white;
+      color: #5436DA;
+    }
+
+    .assign-caret-icon {
+      font-size: 11px;
+      pointer-events: none;
+    }
+
+    /* Transparent select sits on top of the caret so clicking it opens the
+       native project dropdown. */
+    .assign-caret select {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
     }
 
     .container {
@@ -663,10 +688,13 @@
       </button>
 
       <div class="assign-project" title="Add the selected (or filtered) conversations to a project">
-        <select id="assignProjectSelect">
-          <option value="">Add to project…</option>
-        </select>
-        <button id="assignProjectBtn" disabled>Add</button>
+        <button id="assignProjectBtn" disabled>Add to project…</button>
+        <div class="assign-caret">
+          <span class="assign-caret-icon">▾</span>
+          <select id="assignProjectSelect" aria-label="Choose a project to add to">
+            <option value="">Choose project…</option>
+          </select>
+        </div>
       </div>
 
       <button class="delete-all-btn" id="deleteAllBtn" disabled title="Permanently delete all conversations currently shown">
