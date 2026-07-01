@@ -976,98 +976,143 @@ function closeDeleteModal() {
   document.getElementById('deleteModal').style.display = 'none';
 }
 
-// Delete the filtered conversations via the API, with batched concurrency and
-// a progress bar (reuses the export progress modal). Irreversible.
-async function performDelete() {
+// Background deletion. Batches are intentionally small ("for now") to stay well
+// under rate limits. A single worker drains a queue; new deletes append to it and
+// the top-right status line updates live. No progress modal / cancel UI yet.
+const DELETE_BATCH_SIZE = 5;
+const DELETE_INTER_BATCH_MS = 150;
+
+let deleteQueue = [];            // conversations waiting to be deleted
+let deleteWorkerRunning = false;
+let deleteCancelled = false;     // set by the Cancel button; stops after current batch
+let deleteTotal = 0;             // cumulative enqueued for the current run
+let deleteDone = 0;              // succeeded so far this run
+let deleteFailed = 0;            // failed so far this run
+const enqueuedUuids = new Set(); // queued/in-flight — used to dedupe re-adds
+
+// Confirm handler: queue the target conversations for background deletion.
+function performDelete() {
   closeDeleteModal();
-
   const targets = getActionTargets();
-  const total = targets.length;
+  if (!targets.length) return;
+  enqueueDeletes([...targets]);
+}
 
-  const progressModal = document.getElementById('progressModal');
-  const progressTitle = document.getElementById('progressTitle');
-  const progressBar = document.getElementById('progressBar');
-  const progressText = document.getElementById('progressText');
-  const progressStats = document.getElementById('progressStats');
+// Queue conversations for deletion and remove them from the list + cache right
+// away (optimistic). Anything that ends up NOT deleted — a failure, or a
+// cancellation — is restored automatically; a manual refresh also re-fetches
+// server truth as a backstop.
+function enqueueDeletes(targets) {
+  const fresh = targets.filter(c => !enqueuedUuids.has(c.uuid));
+  if (!fresh.length) return;
+  fresh.forEach(c => enqueuedUuids.add(c.uuid));
+  deleteQueue.push(...fresh);
+  deleteTotal += fresh.length;
 
-  progressTitle.textContent = 'Deleting Conversations';
-  progressText.textContent = `Deleting ${total} conversations...`;
-  progressBar.style.width = '0%';
-  progressStats.textContent = '';
-  progressModal.style.display = 'block';
+  // Optimistic removal: drop from the visible list, selection, and cache now.
+  const removing = new Set(fresh.map(c => c.uuid));
+  allConversations = allConversations.filter(c => !removing.has(c.uuid));
+  fresh.forEach(c => selectedUuids.delete(c.uuid));
+  populateProjectFilter();
+  applyFiltersAndSort();
+  saveToCache();
 
-  let cancelDelete = false;
-  const cancelButton = document.getElementById('cancelExport');
-  cancelButton.onclick = () => {
-    cancelDelete = true;
-    progressText.textContent = 'Cancelling...';
-  };
+  updateDeleteStatus();
+  if (!deleteWorkerRunning) runDeleteWorker();
+}
 
-  let deleted = 0;
-  let failed = 0;
-  const failedNames = [];
-  const deletedUuids = new Set();
+// Cancel the remaining queued deletions (already-sent ones can't be recalled).
+function cancelDeletes() {
+  if (!deleteWorkerRunning) return;
+  deleteCancelled = true;
+  updateDeleteStatus();
+}
 
-  // Reuse the user's configured batch size for delete concurrency.
-  const rawBatch = parseInt(document.getElementById('batchSize').value, 10);
-  const batchSize = Number.isFinite(rawBatch) && rawBatch > 0 ? Math.min(rawBatch, 7000) : 25;
+// Put conversations back into the list + cache (used to restore survivors).
+function restoreConversations(convs) {
+  if (!convs.length) return;
+  const have = new Set(allConversations.map(c => c.uuid));
+  convs.forEach(conv => { if (!have.has(conv.uuid)) allConversations.push(conv); });
+  populateProjectFilter();
+  applyFiltersAndSort();
+  saveToCache();
+}
 
-  try {
-    for (let i = 0; i < total; i += batchSize) {
-      if (cancelDelete) break;
+// Update the top-right status line + toggle the Cancel button (blank when idle).
+function updateDeleteStatus() {
+  const bar = document.getElementById('deleteStatus');
+  const text = document.getElementById('deleteStatusText');
+  if (!bar || !text) return;
+  const active = deleteWorkerRunning || deleteQueue.length > 0;
+  bar.classList.toggle('active', active);
+  if (!active) { text.textContent = ''; return; }
+  const processed = deleteDone + deleteFailed;
+  const failedText = deleteFailed ? ` · ${deleteFailed} failed` : '';
+  text.textContent = deleteCancelled
+    ? `Cancelling… ${processed}/${deleteTotal}`
+    : `Deleting ${processed}/${deleteTotal}${failedText}`;
+}
 
-      const batch = targets.slice(i, Math.min(i + batchSize, total));
-      await Promise.all(batch.map(async (conv) => {
-        try {
-          const response = await fetch(
-            `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}`,
-            { method: 'DELETE', credentials: 'include', headers: { 'Accept': 'application/json' } }
-          );
-          // Treat 404 as already-gone (success) rather than an error.
-          if (!response.ok && response.status !== 404) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          deleted++;
-          deletedUuids.add(conv.uuid);
-        } catch (error) {
-          console.error(`Failed to delete ${conv.name}:`, error);
-          failed++;
-          failedNames.push(conv.name);
+// Drain the deletion queue in small batches. Items enqueued while this runs are
+// picked up in later iterations (the while-loop re-checks the queue each pass).
+async function runDeleteWorker() {
+  deleteWorkerRunning = true;
+  deleteCancelled = false;
+  updateDeleteStatus();
+
+  const restore = []; // conversations that were removed but not actually deleted
+
+  while (deleteQueue.length > 0 && !deleteCancelled) {
+    const batch = deleteQueue.splice(0, DELETE_BATCH_SIZE);
+    await Promise.all(batch.map(async (conv) => {
+      try {
+        const response = await fetch(
+          `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}`,
+          { method: 'DELETE', credentials: 'include', headers: { 'Accept': 'application/json' } }
+        );
+        // Treat 404 as already-gone (success) rather than an error.
+        if (!response.ok && response.status !== 404) {
+          throw new Error(`HTTP ${response.status}`);
         }
-      }));
-
-      const progress = Math.round((deleted + failed) / total * 100);
-      progressBar.style.width = `${progress}%`;
-      progressStats.textContent = `${deleted} deleted, ${failed} failed out of ${total}`;
-
-      if (i + batchSize < total && !cancelDelete) {
-        await new Promise(resolve => setTimeout(resolve, 150));
+        deleteDone++;
+      } catch (error) {
+        console.error(`Failed to delete ${conv.name}:`, error);
+        deleteFailed++;
+        restore.push(conv); // wasn't deleted → bring it back
       }
+    }));
+    updateDeleteStatus();
+    if (deleteQueue.length > 0 && !deleteCancelled) {
+      await new Promise(resolve => setTimeout(resolve, DELETE_INTER_BATCH_MS));
     }
+  }
 
-    // Drop deleted conversations from local state and selection, then refresh.
-    allConversations = allConversations.filter(c => !deletedUuids.has(c.uuid));
-    deletedUuids.forEach(u => selectedUuids.delete(u));
-    populateProjectFilter();
-    applyFiltersAndSort();
+  // Cancelled: whatever's still queued was never sent → restore it.
+  const cancelledCount = deleteCancelled ? deleteQueue.length : 0;
+  if (cancelledCount) restore.push(...deleteQueue);
+  deleteQueue = [];
 
-    progressModal.style.display = 'none';
+  restoreConversations(restore);
 
-    if (failed > 0) {
-      showToast(`Deleted ${deleted} of ${total} (${failed} failed). See console for details.`, true);
-    } else if (cancelDelete) {
-      showToast(`Cancelled — deleted ${deleted} of ${total} before stopping.`, true);
-    } else {
-      showToast(`Deleted ${deleted} conversation${deleted === 1 ? '' : 's'}.`);
-    }
-  } catch (error) {
-    console.error('Delete error:', error);
-    progressModal.style.display = 'none';
-    showToast(`Delete failed: ${error.message}`, true);
-  } finally {
-    // Restore the progress modal title for future exports.
-    progressTitle.textContent = 'Exporting Conversations';
-    cancelButton.onclick = null;
+  const done = deleteDone;
+  const failed = deleteFailed;
+  const wasCancelled = deleteCancelled;
+  // Reset the run so the next delete starts a fresh count.
+  deleteTotal = 0;
+  deleteDone = 0;
+  deleteFailed = 0;
+  enqueuedUuids.clear();
+  deleteWorkerRunning = false;
+  deleteCancelled = false;
+  updateDeleteStatus();
+
+  if (wasCancelled) {
+    showToast(`Cancelled — deleted ${done}${cancelledCount ? `, ${cancelledCount} kept` : ''}` +
+      `${failed ? `, ${failed} failed (restored)` : ''}.`, true);
+  } else if (failed > 0) {
+    showToast(`Deleted ${done} (${failed} failed — restored to list).`, true);
+  } else {
+    showToast(`Deleted ${done} conversation${done === 1 ? '' : 's'}.`);
   }
 }
 
@@ -1136,6 +1181,7 @@ function setupEventListeners() {
   document.getElementById('deleteAllBtn').addEventListener('click', openDeleteModal);
   document.getElementById('deleteCancel').addEventListener('click', closeDeleteModal);
   document.getElementById('deleteConfirm').addEventListener('click', performDelete);
+  document.getElementById('cancelDeleteBtn').addEventListener('click', cancelDeletes);
   document.getElementById('deleteConfirmInput').addEventListener('input', (e) => {
     document.getElementById('deleteConfirm').disabled = e.target.value.trim() !== deleteConfirmPhrase;
   });
